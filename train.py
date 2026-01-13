@@ -119,20 +119,16 @@ class CustomDataCollatorWithPadding:
 
 class CustomTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        # `inputs` may be a dict (usual) or a tuple/list (some Trainer configs pass positional args).
-        try:
-            outputs = model(**inputs) if isinstance(inputs, dict) else model(*inputs)
-        except TypeError:
-            # As a fallback, try both calling styles to be robust.
-            try:
-                outputs = model(**inputs)
-            except Exception:
-                outputs = model(*inputs)
-        if isinstance(outputs, dict):
+        # The bound `inpaint_trainer_forward` handles dict/kwargs naturally.
+        outputs = model(**inputs) if isinstance(inputs, dict) else model(inputs)
+
+        if isinstance(outputs, dict) and "loss" in outputs:
             loss = outputs["loss"]
             return (loss, outputs) if return_outputs else loss
         else:
-            return outputs[0]
+            # Fallback for tuple outputs
+            loss = outputs[0] if isinstance(outputs, (tuple, list)) else outputs
+            return (loss, outputs) if return_outputs else loss
 
 
 def build_qwen2lm(qwen_config_path: str, llm_state: Optional[str] = None):
@@ -187,55 +183,6 @@ def build_qwen2lm(qwen_config_path: str, llm_state: Optional[str] = None):
     return qwen2lm
 
 
-def bind_trainer_forward(inpaint_model: Qwen2LMInpaint):
-    # Trainer will call model(**inputs). We expose a robust forward wrapper that
-    # accepts keyword arguments (whatever Trainer passes) and maps them to the
-    # expected batch structure.
-    def inpaint_trainer_forward(self, *args, **inputs):
-        """Robust forward wrapper that accepts either positional or keyword inputs.
-
-        Supported calling forms:
-        - model(**batch)
-        - model(batch_dict)
-        - model(text_token, text_token_len, speech_token, speech_token_len[, phoneme_token])
-        """
-        device = next(self.parameters()).device
-        # normalize inputs from positional args when provided
-        if len(args) == 1 and isinstance(args[0], dict):
-            inputs = args[0]
-        elif len(args) >= 4:
-            # positional mapping
-            inputs = {
-                "text_token": args[0],
-                "text_token_len": args[1],
-                "speech_token": args[2],
-                "speech_token_len": args[3],
-            }
-            if len(args) >= 5:
-                inputs["phoneme_token"] = args[4]
-
-        # Required keys
-        try:
-            text_token = inputs["text_token"].to(device)
-            text_token_len = inputs["text_token_len"].to(device)
-            speech_token = inputs["speech_token"].to(device)
-            speech_token_len = inputs["speech_token_len"].to(device)
-        except KeyError as e:
-            raise KeyError(f"Missing required input key for inpaint forward: {e}")
-
-        batch = {
-            "text_token": text_token,
-            "text_token_len": text_token_len,
-            "speech_token": speech_token,
-            "speech_token_len": speech_token_len,
-        }
-        if "phoneme_token" in inputs and inputs["phoneme_token"] is not None:
-            batch["phoneme_token"] = inputs["phoneme_token"].to(device)
-        return self.forward(batch, device)
-
-    inpaint_model.forward = inpaint_trainer_forward.__get__(inpaint_model)
-
-
 def freeze_backbone_except_inpaint(inpaint_model: Qwen2LMInpaint):
     # Freeze all params in the wrapped Qwen2LM except inpaint params
     for n, p in inpaint_model.qwen2lm.named_parameters():
@@ -259,6 +206,41 @@ def freeze_backbone_except_inpaint(inpaint_model: Qwen2LMInpaint):
     ):
         for p in inpaint_model.gate.parameters():
             p.requires_grad = True
+
+
+def bind_trainer_forward(inpaint_model: Qwen2LMInpaint):
+    def inpaint_trainer_forward(self, *args, **kwargs):
+        """Robust forward wrapper that accepts exactly what Trainer provides."""
+        device = next(self.parameters()).device
+
+        # 1. Start with kwargs as the batch
+        batch = dict(kwargs)
+
+        # 2. If a single dict was passed as the first positional arg, it's the batch
+        if len(args) == 1 and isinstance(args[0], dict):
+            batch.update(args[0])
+
+        # 3. Validation and fallbacks for common Trainer/DataCollator behaviors
+        if "text_token" not in batch:
+            # If we still don't have it, it might be nested or we might be missing columns.
+            # But let's check one more place: positional args if there are many.
+            if len(args) >= 4:
+                batch.update(
+                    {
+                        "text_token": args[0],
+                        "text_token_len": args[1],
+                        "speech_token": args[2],
+                        "speech_token_len": args[3],
+                    }
+                )
+                if len(args) >= 5:
+                    batch["phoneme_token"] = args[4]
+
+        # Now call the original forward(batch, device) defined in modeling.py
+        return self.forward(batch, device)
+
+    # Bind it to the instance
+    inpaint_model.forward = inpaint_trainer_forward.__get__(inpaint_model)
 
 
 def main():
@@ -397,11 +379,11 @@ def main():
         gate_blend=False,
     )
 
-    # bind forward for Trainer
-    bind_trainer_forward(inpaint_model)
-
     # freeze backbone and leave inpaint params trainable
     freeze_backbone_except_inpaint(inpaint_model)
+
+    # bind forward for Trainer
+    bind_trainer_forward(inpaint_model)
 
     # prepare Trainer
     training_args = TrainingArguments(

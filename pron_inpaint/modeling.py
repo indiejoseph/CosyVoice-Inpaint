@@ -159,7 +159,7 @@ class Qwen2LMInpaint(nn.Module):
         text_token_emb = self.qwen2lm.llm.model.model.embed_tokens(text_token)
 
         # if a merged phoneme_token is provided, split it into components and replace per-token embeddings
-        if "phoneme_token" in batch:
+        if "phoneme_token" in batch and batch["phoneme_token"] is not None:
             phoneme_token = batch["phoneme_token"].to(device)
             if phoneme_token.dim() != 2:
                 raise ValueError("`phoneme_token` must be shape (B, 4 * L)")
