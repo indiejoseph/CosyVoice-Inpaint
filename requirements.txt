@@ -1,1 +1,2 @@
 pycantonese
+datasets==3.6.0
