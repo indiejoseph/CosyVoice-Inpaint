@@ -259,12 +259,23 @@ def main():
         """Deterministically zero-out phoneme components so that approximately
         `keep_prob` fraction of tokens keep their phoneme IDs.
         Uses a stable pseudo-random instance based on seed and sample_key.
+
+        This function is robust: if `phon_flat` is shorter than 4*L, it pads
+        each component with zeros to avoid IndexError and returns a 4*L list.
         """
-        onset = phon_flat[0:L]
-        nucleus = phon_flat[L : 2 * L]
-        coda = phon_flat[2 * L : 3 * L]
-        tone = phon_flat[3 * L : 4 * L]
-        rng = random.Random(seed ^ abs(hash(sample_key)) & 0xFFFFFFFF)
+
+        # safely slice and pad to length L
+        def _slice_pad(start: int, end: int):
+            seg = phon_flat[start:end]
+            if len(seg) < L:
+                seg = seg + [0] * (L - len(seg))
+            return list(seg)
+
+        onset = _slice_pad(0, L)
+        nucleus = _slice_pad(L, 2 * L)
+        coda = _slice_pad(2 * L, 3 * L)
+        tone = _slice_pad(3 * L, 4 * L)
+        rng = random.Random(seed ^ (abs(hash(sample_key)) & 0xFFFFFFFF))
         for i in range(L):
             if rng.random() >= keep_prob:
                 onset[i] = 0
@@ -289,6 +300,13 @@ def main():
                 "speech_token": speech_token,
                 "valid_phon": False,
             }
+        # validate phon_flat_full length before masking; reject if mismatch
+        if len(phon_flat_full) != 4 * L:
+            return {
+                "text_token": text_tokens,
+                "speech_token": speech_token,
+                "valid_phon": False,
+            }
         # apply masking to keep only a fraction of phoneme components
         phon_flat = (
             _mask_phon_flat(
@@ -301,13 +319,6 @@ def main():
             if args.phoneme_keep_prob < 1.0
             else phon_flat_full
         )
-        # ensure length matches whitespace/token count
-        if len(phon_flat) != 4 * L:
-            return {
-                "text_token": text_tokens,
-                "speech_token": speech_token,
-                "valid_phon": False,
-            }
         return {
             "text_token": text_tokens,
             "speech_token": speech_token,
