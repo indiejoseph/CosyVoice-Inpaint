@@ -167,15 +167,15 @@ class JyutpingTokenizer:
             outs.append(flat)
         return outs
 
-    def decode(
-        self, flat_ids: List[int], original_tokens: Optional[List[str]] = None
-    ) -> str:
+    def decode(self, flat_ids: List[int]) -> str:
+        """Decode flattened ids into a reconstructed Jyutping string.
+
+        - If multiple items (batch), returns a list of decoded strings.
+        - For tokens with all-zero components (no phoneme), returns "[UNK]" for that slot.
+        """
         if isinstance(flat_ids[0], list):
             # batch
-            return [
-                self.decode(x, orig)
-                for x, orig in zip(flat_ids, original_tokens or [None] * len(flat_ids))
-            ]
+            return [self.decode(x) for x in flat_ids]
         L4 = len(flat_ids)
         if L4 % 4 != 0:
             raise ValueError("flat_ids length must be divisible by 4")
@@ -191,18 +191,13 @@ class JyutpingTokenizer:
             c = self.coda_inv.get(c_ids[i], "")
             t = self.tone_inv.get(t_ids[i], "")
             if o == "" and n == "" and c == "" and t == "":
-                if original_tokens is not None:
-                    toks.append(original_tokens[i])
-                else:
-                    toks.append("[UNK]")
+                toks.append("[UNK]")
             else:
-                # prioritize nucleus+tone if available, otherwise concatenate present parts
-                if n != "":
-                    tok = n + (t if t != "" else "")
-                else:
-                    parts = [p for p in (o, n, c, t) if p != ""]
-                    tok = "".join(parts) if parts else "[UNK]"
-                toks.append(tok)
+                # Reconstruct Jyutping token as onset + nucleus + coda + tone when available
+                tok = "".join([p for p in (o, n, c) if p != ""]) + (
+                    t if t != "" else ""
+                )
+                toks.append(tok if tok != "" else "[UNK]")
         return " ".join(toks)
 
     def vocab_size(self) -> List[int]:

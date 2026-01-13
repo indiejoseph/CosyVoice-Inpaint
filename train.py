@@ -34,7 +34,7 @@ from transformers import (
 
 # Add local cosyvoice and pron_inpaint to path
 sys.path.append("third_party/CosyVoice")
-from cosyvoice.utils.common import ras_sampling, IGNORE_ID
+from cosyvoice.utils.common import ras_sampling
 from cosyvoice.utils.mask import make_pad_mask
 from cosyvoice.llm.llm import Qwen2LM
 
@@ -260,21 +260,33 @@ def main():
         try:
             phon_flat = jyutoken.encode([sample.get("phone", "")])[0]
         except Exception:
-            return {"text_token": text, "speech_token": speech_token, "valid_phon": False}
+            return {
+                "text_token": text,
+                "speech_token": speech_token,
+                "valid_phon": False,
+            }
         # ensure length matches text tokens
         if len(phon_flat) != 4 * L:
-            return {"text_token": text, "speech_token": speech_token, "valid_phon": False}
-        return {"text_token": text, "speech_token": speech_token, "phoneme_token": phon_flat, "valid_phon": True}
+            return {
+                "text_token": text,
+                "speech_token": speech_token,
+                "valid_phon": False,
+            }
+        return {
+            "text_token": text,
+            "speech_token": speech_token,
+            "phoneme_token": phon_flat,
+            "valid_phon": True,
+        }
 
     ds = Dataset.from_pandas(df)
     dataset = ds.map(tokenize_add_label, remove_columns=list(ds.features), num_proc=12)
     dataset = dataset.filter(lambda ex: ex.get("valid_phon", False), num_proc=12)
 
-    # Use the vocabs defined in pron_inpaint.tokenizer
-    onset_vocab_size = len(ONSETS) + 1
-    nucleus_vocab_size = len(NUCLEUSES) + 1
-    coda_vocab_size = len(CODAS) + 1
-    tone_vocab_size = len(TONES) + 1
+    # Use vocab sizes provided by the JyutpingTokenizer
+    onset_vocab_size, nucleus_vocab_size, coda_vocab_size, tone_vocab_size = (
+        jyutoken.vocab_size()
+    )
 
     # drop helper columns and keep phoneme_token (already numeric) from tokenize_add_label
     dataset = dataset.map(
