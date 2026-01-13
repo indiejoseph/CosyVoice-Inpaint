@@ -22,7 +22,7 @@ import sys
 from typing import Any, Dict, List, Optional
 
 import torch
-from datasets import Dataset, load_from_disk
+from datasets import load_dataset, load_from_disk
 from torch.nn.utils.rnn import pad_sequence
 from transformers import (
     AutoConfig,
@@ -243,16 +243,9 @@ def main():
     # Load dataset: prefer HuggingFace `load_from_disk` if a dataset directory is provided;
     # otherwise fall back to CSV input
     try:
-        ds = load_from_disk(args.data)
+        ds = load_dataset(args.data)
     except Exception:
-        df = pd.read_csv(args.data)
-        ds = Dataset.from_pandas(df)
-
-    # keep only Cantonese samples that have phone annotations
-    ds = ds.filter(lambda ex: ex.get("lang") == "yue" and ex.get("phone") is not None)
-    # also require dataset-level validity if provided
-    if "valid" in ds.features:
-        ds = ds.filter(lambda ex: ex.get("valid", True))
+        ds = load_from_disk(args.data)
 
     import random
 
