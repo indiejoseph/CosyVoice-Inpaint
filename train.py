@@ -184,8 +184,29 @@ def bind_trainer_forward(inpaint_model: Qwen2LMInpaint):
     # Trainer will call model(**inputs). We expose a robust forward wrapper that
     # accepts keyword arguments (whatever Trainer passes) and maps them to the
     # expected batch structure.
-    def inpaint_trainer_forward(self, **inputs):
+    def inpaint_trainer_forward(self, *args, **inputs):
+        """Robust forward wrapper that accepts either positional or keyword inputs.
+
+        Supported calling forms:
+        - model(**batch)
+        - model(batch_dict)
+        - model(text_token, text_token_len, speech_token, speech_token_len[, phoneme_token])
+        """
         device = next(self.parameters()).device
+        # normalize inputs from positional args when provided
+        if len(args) == 1 and isinstance(args[0], dict):
+            inputs = args[0]
+        elif len(args) >= 4:
+            # positional mapping
+            inputs = {
+                "text_token": args[0],
+                "text_token_len": args[1],
+                "speech_token": args[2],
+                "speech_token_len": args[3],
+            }
+            if len(args) >= 5:
+                inputs["phoneme_token"] = args[4]
+
         # Required keys
         try:
             text_token = inputs["text_token"].to(device)
@@ -237,15 +258,8 @@ def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # load dataset CSV and filter Cantonese examples with phone annotations
-    import pandas as pd
-
     # Delegate jyutping parsing to pron_inpaint.tokenizer
     from pron_inpaint.tokenizer import (
-        ONSETS,
-        NUCLEUSES,
-        CODAS,
-        TONES,
         JyutpingTokenizer,
     )
 
