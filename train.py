@@ -239,8 +239,7 @@ def main():
         NUCLEUSES,
         CODAS,
         TONES,
-        parse_phone_str,
-        convert_phone_str_to_flat_ids,
+        JyutpingTokenizer,
     )
 
     df = pd.read_csv(args.data)
@@ -248,6 +247,8 @@ def main():
     df = df[(df.get("lang") == "yue") & (df.get("phone").notnull())]
 
     tokenizer = AutoTokenizer.from_pretrained(args.qwen_config)
+    # instantiate a JyutpingTokenizer for parsing phoneme annotations
+    jyutoken = JyutpingTokenizer()
 
     def tokenize_add_label(sample):
         text = tokenizer.encode(sample["text"], add_special_tokens=True)
@@ -257,19 +258,13 @@ def main():
         if isinstance(speech_token, str):
             speech_token = convert_to_list(speech_token)
         try:
-            phon_flat = convert_phone_str_to_flat_ids(sample.get("phone", None), L)
+            phon_flat = jyutoken.encode([sample.get("phone", "")])[0]
         except Exception:
-            return {
-                "text_token": text,
-                "speech_token": speech_token,
-                "valid_phon": False,
-            }
-        return {
-            "text_token": text,
-            "speech_token": speech_token,
-            "phoneme_token": phon_flat,
-            "valid_phon": True,
-        }
+            return {"text_token": text, "speech_token": speech_token, "valid_phon": False}
+        # ensure length matches text tokens
+        if len(phon_flat) != 4 * L:
+            return {"text_token": text, "speech_token": speech_token, "valid_phon": False}
+        return {"text_token": text, "speech_token": speech_token, "phoneme_token": phon_flat, "valid_phon": True}
 
     ds = Dataset.from_pandas(df)
     dataset = ds.map(tokenize_add_label, remove_columns=list(ds.features), num_proc=12)
@@ -282,7 +277,11 @@ def main():
     tone_vocab_size = len(TONES) + 1
 
     # drop helper columns and keep phoneme_token (already numeric) from tokenize_add_label
-    dataset = dataset.map(lambda ex: {k: ex[k] for k in ex if k not in ("valid_phon",)}, remove_columns=["valid_phon"], num_proc=12)
+    dataset = dataset.map(
+        lambda ex: {k: ex[k] for k in ex if k not in ("valid_phon",)},
+        remove_columns=["valid_phon"],
+        num_proc=12,
+    )
 
     dataset = dataset.shuffle(seed=42)
 
