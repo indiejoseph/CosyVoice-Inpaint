@@ -61,26 +61,24 @@ def parse_args():
     p.add_argument("--per_device_eval_batch_size", type=int, default=4)
     p.add_argument("--learning_rate", type=float, default=1e-4)
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    # phoneme mixing: keep probability for phoneme tokens (3:1 text:phoneme => 0.25)
+    p.add_argument(
+        "--phoneme_keep_prob",
+        type=float,
+        default=0.25,
+        help="Probability to keep a phoneme token (per token)",
+    )
+    p.add_argument(
+        "--phoneme_seed",
+        type=int,
+        default=42,
+        help="Deterministic seed for phoneme masking",
+    )
     return p.parse_args()
 
 
 def convert_to_list(x: str, offset: int = 0) -> List[int]:
     return [int(i) + offset for i in x.split(" ") if i != ""]
-
-
-def convert_phoneme_token(x: Optional[str], L: int) -> List[int]:
-    """Return flattened 4*L phoneme token list. If missing, return zeros."""
-    if x is None or str(x).strip() == "":
-        return [0] * (4 * L)
-    # assume x is space-separated integers
-    vals = [int(i) for i in x.split(" ") if i != ""]
-    if len(vals) != 4 * L:
-        # If lengths mismatch, try to pad or truncate
-        if len(vals) < 4 * L:
-            vals = vals + [0] * (4 * L - len(vals))
-        else:
-            vals = vals[: 4 * L]
-    return vals
 
 
 class CustomDataCollatorWithPadding:
@@ -256,9 +254,31 @@ def main():
     if "valid" in ds.features:
         ds = ds.filter(lambda ex: ex.get("valid", True))
 
+    import random
+
     tokenizer = AutoTokenizer.from_pretrained(args.qwen_config)
     # instantiate a JyutpingTokenizer for parsing phoneme annotations
     jyutoken = JyutpingTokenizer()
+
+    def _mask_phon_flat(
+        phon_flat: List[int], L: int, keep_prob: float, seed: int, sample_key: str
+    ) -> List[int]:
+        """Deterministically zero-out phoneme components so that approximately
+        `keep_prob` fraction of tokens keep their phoneme IDs.
+        Uses a stable pseudo-random instance based on seed and sample_key.
+        """
+        onset = phon_flat[0:L]
+        nucleus = phon_flat[L : 2 * L]
+        coda = phon_flat[2 * L : 3 * L]
+        tone = phon_flat[3 * L : 4 * L]
+        rng = random.Random(seed ^ abs(hash(sample_key)) & 0xFFFFFFFF)
+        for i in range(L):
+            if rng.random() >= keep_prob:
+                onset[i] = 0
+                nucleus[i] = 0
+                coda[i] = 0
+                tone[i] = 0
+        return onset + nucleus + coda + tone
 
     def tokenize_add_label(sample):
         # Tokenize without adding special tokens so token count matches whitespace-split phone tokens
@@ -269,26 +289,19 @@ def main():
         if isinstance(speech_token, str):
             speech_token = convert_to_list(speech_token)
         try:
-            phon_flat = jyutoken.encode([sample.get("phone", "")])[0]
+            phon_flat_full = jyutoken.encode([sample.get("phone", "")])[0]
         except Exception:
-            return {
-                "text_token": text_tokens,
-                "speech_token": speech_token,
-                "valid_phon": False,
-            }
+            return {"text_token": text_tokens, "speech_token": speech_token, "valid_phon": False}
+        # apply masking to keep only a fraction of phoneme components
+        phon_flat = (
+            _mask_phon_flat(phon_flat_full, L, args.phoneme_keep_prob, args.phoneme_seed, sample.get("text", ""))
+            if args.phoneme_keep_prob < 1.0
+            else phon_flat_full
+        )
         # ensure length matches whitespace/token count
         if len(phon_flat) != 4 * L:
-            return {
-                "text_token": text_tokens,
-                "speech_token": speech_token,
-                "valid_phon": False,
-            }
-        return {
-            "text_token": text_tokens,
-            "speech_token": speech_token,
-            "phoneme_token": phon_flat,
-            "valid_phon": True,
-        }
+            return {"text_token": text_tokens, "speech_token": speech_token, "valid_phon": False}
+        return {"text_token": text_tokens, "speech_token": speech_token, "phoneme_token": phon_flat, "valid_phon": True}
 
     dataset = ds.map(
         tokenize_add_label,
