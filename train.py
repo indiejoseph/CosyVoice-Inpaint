@@ -119,8 +119,15 @@ class CustomDataCollatorWithPadding:
 
 class CustomTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        # `inputs` is already prepared by the data collator and contains our keys
-        outputs = model(**inputs)
+        # `inputs` may be a dict (usual) or a tuple/list (some Trainer configs pass positional args).
+        try:
+            outputs = model(**inputs) if isinstance(inputs, dict) else model(*inputs)
+        except TypeError:
+            # As a fallback, try both calling styles to be robust.
+            try:
+                outputs = model(**inputs)
+            except Exception:
+                outputs = model(*inputs)
         if isinstance(outputs, dict):
             loss = outputs["loss"]
             return (loss, outputs) if return_outputs else loss
