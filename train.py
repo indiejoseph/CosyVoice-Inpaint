@@ -22,7 +22,7 @@ import sys
 from typing import Any, Dict, List, Optional
 
 import torch
-from datasets import Dataset
+from datasets import Dataset, load_from_disk
 from torch.nn.utils.rnn import pad_sequence
 from transformers import (
     AutoConfig,
@@ -242,17 +242,28 @@ def main():
         JyutpingTokenizer,
     )
 
-    df = pd.read_csv(args.data)
+    # Load dataset: prefer HuggingFace `load_from_disk` if a dataset directory is provided;
+    # otherwise fall back to CSV input
+    try:
+        ds = load_from_disk(args.data)
+    except Exception:
+        df = pd.read_csv(args.data)
+        ds = Dataset.from_pandas(df)
+
     # keep only Cantonese samples that have phone annotations
-    df = df[(df.get("lang") == "yue") & (df.get("phone").notnull())]
+    ds = ds.filter(lambda ex: ex.get("lang") == "yue" and ex.get("phone") is not None)
+    # also require dataset-level validity if provided
+    if "valid" in ds.features:
+        ds = ds.filter(lambda ex: ex.get("valid", True))
 
     tokenizer = AutoTokenizer.from_pretrained(args.qwen_config)
     # instantiate a JyutpingTokenizer for parsing phoneme annotations
     jyutoken = JyutpingTokenizer()
 
     def tokenize_add_label(sample):
-        text = tokenizer.encode(sample["text"], add_special_tokens=True)
-        L = len(text)
+        # Tokenize without adding special tokens so token count matches whitespace-split phone tokens
+        text_tokens = tokenizer.encode(sample["text"], add_special_tokens=False)
+        L = len(text_tokens)
         # speech tokens may already be a list or a space-separated string
         speech_token = sample.get("speech_tokens", [])
         if isinstance(speech_token, str):
@@ -261,26 +272,29 @@ def main():
             phon_flat = jyutoken.encode([sample.get("phone", "")])[0]
         except Exception:
             return {
-                "text_token": text,
+                "text_token": text_tokens,
                 "speech_token": speech_token,
                 "valid_phon": False,
             }
-        # ensure length matches text tokens
+        # ensure length matches whitespace/token count
         if len(phon_flat) != 4 * L:
             return {
-                "text_token": text,
+                "text_token": text_tokens,
                 "speech_token": speech_token,
                 "valid_phon": False,
             }
         return {
-            "text_token": text,
+            "text_token": text_tokens,
             "speech_token": speech_token,
             "phoneme_token": phon_flat,
             "valid_phon": True,
         }
 
-    ds = Dataset.from_pandas(df)
-    dataset = ds.map(tokenize_add_label, remove_columns=list(ds.features), num_proc=12)
+    dataset = ds.map(
+        tokenize_add_label,
+        remove_columns=list(ds.features) if hasattr(ds, "features") else None,
+        num_proc=12,
+    )
     dataset = dataset.filter(lambda ex: ex.get("valid_phon", False), num_proc=12)
 
     # Use vocab sizes provided by the JyutpingTokenizer
