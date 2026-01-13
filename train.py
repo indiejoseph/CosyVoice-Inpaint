@@ -181,25 +181,28 @@ def build_qwen2lm(qwen_config_path: str, llm_state: Optional[str] = None):
 
 
 def bind_trainer_forward(inpaint_model: Qwen2LMInpaint):
-    # Trainer will call model(**inputs). We expose a thin forward wrapper.
-    def inpaint_trainer_forward(
-        self,
-        text_token: torch.LongTensor,
-        text_token_len: torch.LongTensor,
-        speech_token: torch.LongTensor,
-        speech_token_len: torch.LongTensor,
-        phoneme_token: Optional[torch.LongTensor] = None,
-        **kwargs
-    ):
+    # Trainer will call model(**inputs). We expose a robust forward wrapper that
+    # accepts keyword arguments (whatever Trainer passes) and maps them to the
+    # expected batch structure.
+    def inpaint_trainer_forward(self, **inputs):
         device = next(self.parameters()).device
+        # Required keys
+        try:
+            text_token = inputs["text_token"].to(device)
+            text_token_len = inputs["text_token_len"].to(device)
+            speech_token = inputs["speech_token"].to(device)
+            speech_token_len = inputs["speech_token_len"].to(device)
+        except KeyError as e:
+            raise KeyError(f"Missing required input key for inpaint forward: {e}")
+
         batch = {
-            "text_token": text_token.to(device),
-            "text_token_len": text_token_len.to(device),
-            "speech_token": speech_token.to(device),
-            "speech_token_len": speech_token_len.to(device),
+            "text_token": text_token,
+            "text_token_len": text_token_len,
+            "speech_token": speech_token,
+            "speech_token_len": speech_token_len,
         }
-        if phoneme_token is not None:
-            batch["phoneme_token"] = phoneme_token.to(device)
+        if "phoneme_token" in inputs and inputs["phoneme_token"] is not None:
+            batch["phoneme_token"] = inputs["phoneme_token"].to(device)
         return self.forward(batch, device)
 
     inpaint_model.forward = inpaint_trainer_forward.__get__(inpaint_model)
