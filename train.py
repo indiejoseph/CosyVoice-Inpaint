@@ -291,17 +291,36 @@ def main():
         try:
             phon_flat_full = jyutoken.encode([sample.get("phone", "")])[0]
         except Exception:
-            return {"text_token": text_tokens, "speech_token": speech_token, "valid_phon": False}
+            return {
+                "text_token": text_tokens,
+                "speech_token": speech_token,
+                "valid_phon": False,
+            }
         # apply masking to keep only a fraction of phoneme components
         phon_flat = (
-            _mask_phon_flat(phon_flat_full, L, args.phoneme_keep_prob, args.phoneme_seed, sample.get("text", ""))
+            _mask_phon_flat(
+                phon_flat_full,
+                L,
+                args.phoneme_keep_prob,
+                args.phoneme_seed,
+                sample.get("text", ""),
+            )
             if args.phoneme_keep_prob < 1.0
             else phon_flat_full
         )
         # ensure length matches whitespace/token count
         if len(phon_flat) != 4 * L:
-            return {"text_token": text_tokens, "speech_token": speech_token, "valid_phon": False}
-        return {"text_token": text_tokens, "speech_token": speech_token, "phoneme_token": phon_flat, "valid_phon": True}
+            return {
+                "text_token": text_tokens,
+                "speech_token": speech_token,
+                "valid_phon": False,
+            }
+        return {
+            "text_token": text_tokens,
+            "speech_token": speech_token,
+            "phoneme_token": phon_flat,
+            "valid_phon": True,
+        }
 
     dataset = ds.map(
         tokenize_add_label,
