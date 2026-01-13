@@ -22,7 +22,7 @@ import sys
 from typing import Any, Dict, List, Optional
 
 import torch
-from datasets import load_dataset, load_from_disk
+from datasets import load_dataset, load_from_disk, Dataset
 from torch.nn.utils.rnn import pad_sequence
 from transformers import (
     AutoConfig,
@@ -217,12 +217,22 @@ def main():
         JyutpingTokenizer,
     )
 
-    # Load dataset: prefer HuggingFace `load_from_disk` if a dataset directory is provided;
-    # otherwise fall back to CSV input
-    try:
-        ds = load_dataset(args.data)
-    except Exception:
-        ds = load_from_disk(args.data)
+    # Load dataset: if a CSV file path is provided, use pandas to read and convert to a Dataset;
+    # otherwise prefer HuggingFace `load_dataset` and fall back to `load_from_disk`.
+    if isinstance(args.data, str) and args.data.lower().endswith(".csv"):
+        try:
+            import pandas as pd  # optional dependency
+        except Exception:
+            raise RuntimeError(
+                "pandas is required to load a CSV dataset; please install it (pip install pandas)"
+            )
+        df = pd.read_csv(args.data)
+        ds = Dataset.from_pandas(df)
+    else:
+        try:
+            ds = load_dataset(args.data)
+        except Exception:
+            ds = load_from_disk(args.data)
 
     import random
 
