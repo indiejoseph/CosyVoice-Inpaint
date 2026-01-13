@@ -11,16 +11,15 @@ and provides:
 
 Notes / API conventions (deliberately simple to start):
 - Batch-level expected keys (optional):
-  - `phoneme_onset`, `phoneme_nucleus`, `phoneme_coda`, `phoneme_tone`
-    each with shape (B, L) and dtype `torch.long`. An index of 0 means "no phoneme".
-  - If these are absent, behavior falls back to standard Qwen2LM forward.
+  - `phoneme_token` with shape `(B, 4 * L)` where `L` is the `text_token` length. The layout is grouped by component:
+    `[onset_0, ..., onset_{L-1}, nucleus_0, ..., nucleus_{L-1}, coda_0, ..., coda_{L-1}, tone_0, ..., tone_{L-1}]`.
+    The implementation will split this into four `(B, L)` component tensors `(onset, nucleus, coda, tone)`. An index of `0` means "no phoneme".
+  - If this key is absent, behavior falls back to standard Qwen2LM forward.
 - Multi-syllable insertion (multiple phoneme embeddings per text token)
   is *not* supported by this initial implementation. It is documented and may
   be extended later.
 
 """
-
-from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -144,11 +143,11 @@ class Qwen2LMInpaint(nn.Module):
         """A drop-in forward that mirrors `Qwen2LM.forward` but supports per-token phoneme replacement.
 
         Optional batch keys (see class docstring):
-        - phoneme_onset, phoneme_nucleus, phoneme_coda, phoneme_tone (LongTensor (B,L))
+        - `phoneme_token` (LongTensor `(B, 4*L)`) containing grouped components `[onset..., nucleus..., coda..., tone...]`.
 
-        Behavior: if phoneme_* keys are present, will compute composed phoneme embeddings
-        and replace the corresponding positions in `text_token_emb` prior to building
-        the LM input / target.
+        Behavior: if `phoneme_token` is present, it will be split into four `(B, L)` tensors
+        and used to compute composed phoneme embeddings which replace the corresponding
+        positions in `text_token_emb` prior to building the LM input / target.
         """
         # mirror the Qwen2LM forward behavior up to text_token_emb
         text_token = batch["text_token"].to(device)
@@ -159,24 +158,27 @@ class Qwen2LMInpaint(nn.Module):
         # 1. encode text_token
         text_token_emb = self.qwen2lm.llm.model.model.embed_tokens(text_token)
 
-        # if phoneme components provided, replace per-token embeddings
-        if all(
-            k in batch
-            for k in (
-                "phoneme_onset",
-                "phoneme_nucleus",
-                "phoneme_coda",
-                "phoneme_tone",
-            )
-        ):
-            onset = batch["phoneme_onset"].to(device)
-            nucleus = batch["phoneme_nucleus"].to(device)
-            coda = batch["phoneme_coda"].to(device)
-            tone = batch["phoneme_tone"].to(device)
-            # basic shape checks
+        # if a merged phoneme_token is provided, split it into components and replace per-token embeddings
+        if "phoneme_token" in batch:
+            phoneme_token = batch["phoneme_token"].to(device)
+            if phoneme_token.dim() != 2:
+                raise ValueError("`phoneme_token` must be shape (B, 4 * L)")
+            B, PT_len = phoneme_token.shape
+            _, text_len = text_token.shape
+            if PT_len != 4 * text_len:
+                raise ValueError(
+                    "`phoneme_token` second dimension must equal 4 * text_token length"
+                )
+            L = text_len
+            # layout: [onset_0..onset_{L-1}, nucleus_0..nucleus_{L-1}, coda_0..coda_{L-1}, tone_0..tone_{L-1}]
+            onset = phoneme_token[:, 0:L]
+            nucleus = phoneme_token[:, L : 2 * L]
+            coda = phoneme_token[:, 2 * L : 3 * L]
+            tone = phoneme_token[:, 3 * L : 4 * L]
+            # ensure shapes are (B, L)
             if onset.shape != text_token.shape:
                 raise ValueError(
-                    "`phoneme_*` tensors must have same shape as `text_token`"
+                    "`phoneme_token` should split into (B, L) component tensors matching `text_token.shape`"
                 )
             text_token_emb = self.replace_text_embeddings(
                 text_token_emb, onset, nucleus, coda, tone
@@ -239,6 +241,3 @@ class Qwen2LMInpaint(nn.Module):
                 nn.init.normal_(emb.weight, mean=0.0, std=0.02)
                 emb.weight.data[0].zero_()  # keep padding idx zero
                 emb.weight.data[1:] += avg.unsqueeze(0)
-
-
-# End of file
