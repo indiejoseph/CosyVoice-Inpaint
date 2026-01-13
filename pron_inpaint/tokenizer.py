@@ -119,13 +119,99 @@ def convert_phone_str_to_flat_ids(phone_str: str, L: int) -> List[int]:
     return onset_ids + nucleus_ids + coda_ids + tone_ids
 
 
-# Simple self-test when run as a script
+class JyutpingTokenizer:
+    """Tokenizer for Jyutping phoneme strings.
+
+    Interface inspired by HuggingFace tokenizers (lightweight):
+    - tokenize(list[str]) -> list[list[str]]
+    - encode(list[str]) -> list[list[int]]  # flattened 4*L ids
+    - decode(flat_ids: List[int], original_tokens: Optional[List[str]] = None) -> str
+    - vocab_size() -> [onset_size, nucleus_size, coda_size, tone_size]
+    - __len__ returns total vocab size (sum)
+
+    Notes:
+    - Unknown tokens or punctuation map to id 0 (pad/UNK)
+    - `encode` works on a list of input strings and returns a list of flattened id lists
+    - `decode` reconstructs tokens from ids. If `original_tokens` is provided it will be
+      used to recover non-phoneme tokens (punctuation) where all component ids == 0.
+    """
+
+    def __init__(self):
+        self.onset_map = ONSET_MAP
+        self.nucleus_map = NUCLEUS_MAP
+        self.coda_map = CODA_MAP
+        self.tone_map = TONE_MAP
+
+        # reverse maps
+        self.onset_inv = {v: k for k, v in self.onset_map.items()}
+        self.nucleus_inv = {v: k for k, v in self.nucleus_map.items()}
+        self.coda_inv = {v: k for k, v in self.coda_map.items()}
+        self.tone_inv = {v: k for k, v in self.tone_map.items()}
+
+    def tokenize(self, texts: List[str]) -> List[List[str]]:
+        return [[t for t in s.strip().split()] for s in texts]
+
+    def encode(self, texts: List[str]) -> List[List[int]]:
+        outs = []
+        for s in texts:
+            toks = s.strip().split()
+            L = len(toks)
+            onset_ids, nucleus_ids, coda_ids, tone_ids = [], [], [], []
+            for tok in toks:
+                o, n, c, t = parse_jyutping_token(tok)
+                onset_ids.append(self.onset_map.get(o, 0))
+                nucleus_ids.append(self.nucleus_map.get(n, 0))
+                coda_ids.append(self.coda_map.get(c, 0))
+                tone_ids.append(self.tone_map.get(t, 0))
+            flat = onset_ids + nucleus_ids + coda_ids + tone_ids
+            outs.append(flat)
+        return outs
+
+    def decode(self, flat_ids: List[int], original_tokens: Optional[List[str]] = None) -> str:
+        if isinstance(flat_ids[0], list):
+            # batch
+            return [self.decode(x, orig) for x, orig in zip(flat_ids, original_tokens or [None] * len(flat_ids))]
+        L4 = len(flat_ids)
+        if L4 % 4 != 0:
+            raise ValueError("flat_ids length must be divisible by 4")
+        L = L4 // 4
+        o_ids = flat_ids[0:L]
+        n_ids = flat_ids[L : 2 * L]
+        c_ids = flat_ids[2 * L : 3 * L]
+        t_ids = flat_ids[3 * L : 4 * L]
+        toks = []
+        for i in range(L):
+            o = self.onset_inv.get(o_ids[i], "")
+            n = self.nucleus_inv.get(n_ids[i], "")
+            c = self.coda_inv.get(c_ids[i], "")
+            t = self.tone_inv.get(t_ids[i], "")
+            if o == "" and n == "" and c == "" and t == "":
+                if original_tokens is not None:
+                    toks.append(original_tokens[i])
+                else:
+                    toks.append("[UNK]")
+            else:
+                # prioritize nucleus+tone if available, otherwise concatenate present parts
+                if n != "":
+                    tok = n + (t if t != "" else "")
+                else:
+                    parts = [p for p in (o, n, c, t) if p != ""]
+                    tok = "".join(parts) if parts else "[UNK]"
+                toks.append(tok)
+        return " ".join(toks)
+
+    def vocab_size(self) -> List[int]:
+        return [len(self.onset_map) + 1, len(self.nucleus_map) + 1, len(self.coda_map) + 1, len(self.tone_map) + 1]
+
+    def __len__(self) -> int:
+        return sum(self.vocab_size())
+
+
+# small self-test
 if __name__ == "__main__":
-    phones = "hou2 aa3 !"
-    try:
-        o, n, c, t = parse_phone_str(phones, 3)
-        print("parsed:", o, n, c, t)
-        flat = convert_phone_str_to_flat_ids(phones, 3)
-        print("flat ids:", flat)
-    except Exception as e:
-        print("parse error:", e)
+    tok = JyutpingTokenizer()
+    s = "hou2 aa3 !"
+    print("tokenize:", tok.tokenize([s]))
+    enc = tok.encode([s])[0]
+    print("encoded len", len(enc), enc)
+    print("decoded:", tok.decode(enc, original_tokens=s.split()))
