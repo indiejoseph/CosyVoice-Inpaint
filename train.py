@@ -295,9 +295,11 @@ def main():
         try:
             phon_flat_full = jyutoken.encode([sample.get("phone", "")])[0]
         except Exception:
+            # return consistent keys so map writer doesn't fail; mark invalid
             return {
                 "text_token": text_tokens,
                 "speech_token": speech_token,
+                "phoneme_token": [0] * (4 * L),
                 "valid_phon": False,
             }
         # validate phon_flat_full length before masking; reject if mismatch
@@ -305,6 +307,7 @@ def main():
             return {
                 "text_token": text_tokens,
                 "speech_token": speech_token,
+                "phoneme_token": [0] * (4 * L),
                 "valid_phon": False,
             }
         # apply masking to keep only a fraction of phoneme components
