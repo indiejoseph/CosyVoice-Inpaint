@@ -320,26 +320,22 @@ def main():
     dataset = ds.map(tokenize_add_label, remove_columns=list(ds.features), num_proc=12)
     dataset = dataset.filter(lambda ex: ex.get("valid_phon", False), num_proc=12)
 
-    # Build component vocabularies (reserve index 0 for "no-phoneme")
-    def collect_unique(column_name: str):
-        vals = [v for sub in dataset[column_name] for v in sub]
-        uniques = sorted({v for v in vals if v != ""})
-        return uniques
+    # Fixed component vocabularies (reserve index 0 for "no-phoneme" / pad)
+    ONSETS = "b d g gw z p t k kw c m n ng f h s l w j".split()
+    NUCLEUSES = "aa a i yu u oe e eo o m n ng".split()
+    CODAS = "p t k m n ng i u".split()
+    TONES = "1 2 3 4 5 6".split()
 
-    onset_vals = collect_unique("phoneme_onset_str")
-    nucleus_vals = collect_unique("phoneme_nucleus_str")
-    coda_vals = collect_unique("phoneme_coda_str")
-    tone_vals = collect_unique("phoneme_tone_str")
+    # Build maps from string->id; index 0 is reserved for padding/no-phoneme
+    onset_map = {v: i + 1 for i, v in enumerate(ONSETS)}
+    nucleus_map = {v: i + 1 for i, v in enumerate(NUCLEUSES)}
+    coda_map = {v: i + 1 for i, v in enumerate(CODAS)}
+    tone_map = {v: i + 1 for i, v in enumerate(TONES)}
 
-    onset_map = {v: i + 1 for i, v in enumerate(onset_vals)}
-    nucleus_map = {v: i + 1 for i, v in enumerate(nucleus_vals)}
-    coda_map = {v: i + 1 for i, v in enumerate(coda_vals)}
-    tone_map = {v: i + 1 for i, v in enumerate(tone_vals)}
-
-    onset_vocab_size = len(onset_map) + 1
-    nucleus_vocab_size = len(nucleus_map) + 1
-    coda_vocab_size = len(coda_map) + 1
-    tone_vocab_size = len(tone_map) + 1
+    onset_vocab_size = len(ONSETS) + 1
+    nucleus_vocab_size = len(NUCLEUSES) + 1
+    coda_vocab_size = len(CODAS) + 1
+    tone_vocab_size = len(TONES) + 1
 
     def str_components_to_ids(sample):
         # maps component string lists to flattened numeric phoneme_token list
