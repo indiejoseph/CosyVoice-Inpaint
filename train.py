@@ -232,63 +232,22 @@ def main():
 
     # load dataset CSV and filter Cantonese examples with phone annotations
     import pandas as pd
-    import re
 
-    try:
-        import pycantonese
-    except Exception as e:
-        raise ImportError(
-            "pycantonese is required to parse Jyutping annotations. Install it with `pip install pycantonese`."
-        ) from e
+    # Delegate jyutping parsing to pron_inpaint.tokenizer
+    from pron_inpaint.tokenizer import (
+        ONSETS,
+        NUCLEUSES,
+        CODAS,
+        TONES,
+        parse_phone_str,
+        convert_phone_str_to_flat_ids,
+    )
 
     df = pd.read_csv(args.data)
     # keep only Cantonese samples that have phone annotations
     df = df[(df.get("lang") == "yue") & (df.get("phone").notnull())]
 
     tokenizer = AutoTokenizer.from_pretrained(args.qwen_config)
-
-    jyutping_re = re.compile(r"^[a-zA-Z]+[1-9]$")
-
-    def parse_phone_components(phone_str: str, L: int):
-        """Split phone_str by spaces and return component string lists.
-
-        Returns (onset_l, nucleus_l, coda_l, tone_l, ok)
-        - ok == False if lengths mismatch or parse failed.
-        - Non-jyutping tokens (punctuation) are mapped to empty strings (""), which will
-          later map to index 0 (no-phoneme).
-        """
-        if phone_str is None:
-            return None, None, None, None, False
-        parts = [p for p in phone_str.strip().split()]
-        if len(parts) != L:
-            return None, None, None, None, False
-        onset_l, nucleus_l, coda_l, tone_l = [], [], [], []
-        for tok in parts:
-            if jyutping_re.match(tok):
-                try:
-                    parsed = pycantonese.parse_jyutping(tok)
-                    syll = parsed[0]
-                    try:
-                        o = syll.onset
-                        n = syll.nucleus
-                        c = syll.coda
-                        t = str(syll.tone)
-                    except Exception:
-                        o, n, c, t = syll[0], syll[1], syll[2], str(syll[3])
-                except Exception:
-                    m = re.match(r"^([a-zA-Z]+?)([1-9])$", tok)
-                    if m:
-                        o, n, c, t = "", m.group(1), "", m.group(2)
-                    else:
-                        o, n, c, t = "", "", "", ""
-            else:
-                # punctuation or non-jyutping -> no phoneme
-                o, n, c, t = "", "", "", ""
-            onset_l.append(o)
-            nucleus_l.append(n)
-            coda_l.append(c)
-            tone_l.append(t)
-        return onset_l, nucleus_l, coda_l, tone_l, True
 
     def tokenize_add_label(sample):
         text = tokenizer.encode(sample["text"], add_special_tokens=True)
@@ -297,10 +256,9 @@ def main():
         speech_token = sample.get("speech_tokens", [])
         if isinstance(speech_token, str):
             speech_token = convert_to_list(speech_token)
-        onset_l, nucleus_l, coda_l, tone_l, ok = parse_phone_components(
-            sample.get("phone", None), L
-        )
-        if not ok:
+        try:
+            phon_flat = convert_phone_str_to_flat_ids(sample.get("phone", None), L)
+        except Exception:
             return {
                 "text_token": text,
                 "speech_token": speech_token,
@@ -309,10 +267,7 @@ def main():
         return {
             "text_token": text,
             "speech_token": speech_token,
-            "phoneme_onset_str": onset_l,
-            "phoneme_nucleus_str": nucleus_l,
-            "phoneme_coda_str": coda_l,
-            "phoneme_tone_str": tone_l,
+            "phoneme_token": phon_flat,
             "valid_phon": True,
         }
 
@@ -320,42 +275,14 @@ def main():
     dataset = ds.map(tokenize_add_label, remove_columns=list(ds.features), num_proc=12)
     dataset = dataset.filter(lambda ex: ex.get("valid_phon", False), num_proc=12)
 
-    # Fixed component vocabularies (reserve index 0 for "no-phoneme" / pad)
-    ONSETS = "b d g gw z p t k kw c m n ng f h s l w j".split()
-    NUCLEUSES = "aa a i yu u oe e eo o m n ng".split()
-    CODAS = "p t k m n ng i u".split()
-    TONES = "1 2 3 4 5 6".split()
-
-    # Build maps from string->id; index 0 is reserved for padding/no-phoneme
-    onset_map = {v: i + 1 for i, v in enumerate(ONSETS)}
-    nucleus_map = {v: i + 1 for i, v in enumerate(NUCLEUSES)}
-    coda_map = {v: i + 1 for i, v in enumerate(CODAS)}
-    tone_map = {v: i + 1 for i, v in enumerate(TONES)}
-
+    # Use the vocabs defined in pron_inpaint.tokenizer
     onset_vocab_size = len(ONSETS) + 1
     nucleus_vocab_size = len(NUCLEUSES) + 1
     coda_vocab_size = len(CODAS) + 1
     tone_vocab_size = len(TONES) + 1
 
-    def str_components_to_ids(sample):
-        # maps component string lists to flattened numeric phoneme_token list
-        onset_ids = [onset_map.get(s, 0) for s in sample["phoneme_onset_str"]]
-        nucleus_ids = [nucleus_map.get(s, 0) for s in sample["phoneme_nucleus_str"]]
-        coda_ids = [coda_map.get(s, 0) for s in sample["phoneme_coda_str"]]
-        tone_ids = [tone_map.get(s, 0) for s in sample["phoneme_tone_str"]]
-        flat = onset_ids + nucleus_ids + coda_ids + tone_ids
-        return {"phoneme_token": flat}
-
-    dataset = dataset.map(
-        str_components_to_ids,
-        remove_columns=[
-            "phoneme_onset_str",
-            "phoneme_nucleus_str",
-            "phoneme_coda_str",
-            "phoneme_tone_str",
-            "valid_phon",
-        ],
-    )
+    # drop helper columns and keep phoneme_token (already numeric) from tokenize_add_label
+    dataset = dataset.map(lambda ex: {k: ex[k] for k in ex if k not in ("valid_phon",)}, remove_columns=["valid_phon"], num_proc=12)
 
     dataset = dataset.shuffle(seed=42)
 
