@@ -119,8 +119,8 @@ class CustomDataCollatorWithPadding:
 
 class CustomTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        # The bound `inpaint_trainer_forward` handles dict/kwargs naturally.
-        outputs = model(**inputs) if isinstance(inputs, dict) else model(inputs)
+        # Model now supports **inputs directly via the updated modeling.py
+        outputs = model(**inputs)
 
         if isinstance(outputs, dict) and "loss" in outputs:
             loss = outputs["loss"]
@@ -206,44 +206,6 @@ def freeze_backbone_except_inpaint(inpaint_model: Qwen2LMInpaint):
     ):
         for p in inpaint_model.gate.parameters():
             p.requires_grad = True
-
-
-def bind_trainer_forward(inpaint_model: Qwen2LMInpaint):
-    # Capture the original class method to avoid recursion
-    original_forward_func = type(inpaint_model).forward
-
-    def inpaint_trainer_forward(self, *args, **kwargs):
-        """Robust forward wrapper that accepts exactly what Trainer provides."""
-        device = next(self.parameters()).device
-
-        # 1. Start with kwargs as the batch
-        batch = dict(kwargs)
-
-        # 2. If a single dict was passed as the first positional arg, it's the batch
-        if len(args) == 1 and isinstance(args[0], dict):
-            batch.update(args[0])
-
-        # 3. Validation and fallbacks for common Trainer/DataCollator behaviors
-        if "text_token" not in batch:
-            # If we still don't have it, it might be nested or we might be missing columns.
-            # But let's check one more place: positional args if there are many.
-            if len(args) >= 4:
-                batch.update(
-                    {
-                        "text_token": args[0],
-                        "text_token_len": args[1],
-                        "speech_token": args[2],
-                        "speech_token_len": args[3],
-                    }
-                )
-                if len(args) >= 5:
-                    batch["phoneme_token"] = args[4]
-
-        # Call the original class method explicitly to avoid recursion
-        return original_forward_func(self, batch, device)
-
-    # Bind it to the instance
-    inpaint_model.forward = inpaint_trainer_forward.__get__(inpaint_model)
 
 
 def main():
@@ -385,9 +347,6 @@ def main():
     # freeze backbone and leave inpaint params trainable
     freeze_backbone_except_inpaint(inpaint_model)
 
-    # bind forward for Trainer
-    bind_trainer_forward(inpaint_model)
-
     # prepare Trainer
     training_args = TrainingArguments(
         output_dir=args.output_dir,
@@ -402,7 +361,7 @@ def main():
         save_total_limit=3,
         remove_unused_columns=False,
         label_names=["speech_token"],
-        report_to=(args.report_to if args.report_to != "none" else None),
+        report_to=args.report_to,
     )
 
     data_collator = CustomDataCollatorWithPadding(num_speech_tokens=6561)

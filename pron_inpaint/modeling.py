@@ -79,15 +79,6 @@ class Qwen2LMInpaint(nn.Module):
                 nn.Linear(2 * d_model, d_model), nn.GELU(), nn.Linear(d_model, d_model)
             )
 
-        # By design: CosyVoice LLM should remain frozen. Freeze underlying llm's params.
-        self._freeze_llm()
-
-    def _freeze_llm(self):
-        """Freeze parameters of the underlying transformer LLM (not the wrapper)."""
-        if hasattr(self.qwen2lm, "llm") and self.qwen2lm.llm is not None:
-            for p in self.qwen2lm.llm.parameters():
-                p.requires_grad = False
-
     def compose_phoneme(
         self,
         onset: torch.LongTensor,
