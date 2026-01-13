@@ -74,6 +74,12 @@ def parse_args():
         default=42,
         help="Deterministic seed for phoneme masking",
     )
+    p.add_argument(
+        "--report_to",
+        type=str,
+        default="none",
+        help="Reporting backend for Trainer (e.g., 'none' or 'wandb')",
+    )
     return p.parse_args()
 
 
@@ -380,13 +386,14 @@ def main():
         per_device_train_batch_size=args.per_device_train_batch_size,
         per_device_eval_batch_size=args.per_device_eval_batch_size,
         learning_rate=args.learning_rate,
-        evaluation_strategy="epoch",
+        eval_strategy="epoch",
         save_strategy="epoch",
         logging_strategy="steps",
         logging_steps=100,
         save_total_limit=3,
         remove_unused_columns=False,
         label_names=["speech_token"],
+        report_to=(args.report_to if args.report_to != "none" else None),
     )
 
     data_collator = CustomDataCollatorWithPadding(num_speech_tokens=6561)
