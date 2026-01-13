@@ -209,6 +209,9 @@ def freeze_backbone_except_inpaint(inpaint_model: Qwen2LMInpaint):
 
 
 def bind_trainer_forward(inpaint_model: Qwen2LMInpaint):
+    # Capture the original class method to avoid recursion
+    original_forward_func = type(inpaint_model).forward
+
     def inpaint_trainer_forward(self, *args, **kwargs):
         """Robust forward wrapper that accepts exactly what Trainer provides."""
         device = next(self.parameters()).device
@@ -236,8 +239,8 @@ def bind_trainer_forward(inpaint_model: Qwen2LMInpaint):
                 if len(args) >= 5:
                     batch["phoneme_token"] = args[4]
 
-        # Now call the original forward(batch, device) defined in modeling.py
-        return self.forward(batch, device)
+        # Call the original class method explicitly to avoid recursion
+        return original_forward_func(self, batch, device)
 
     # Bind it to the instance
     inpaint_model.forward = inpaint_trainer_forward.__get__(inpaint_model)
