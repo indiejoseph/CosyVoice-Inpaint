@@ -10,7 +10,7 @@ This module uses `pycantonese` when available for robust parsing and falls back 
 conservative regex if not.
 """
 
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 import re
 
 # Fixed component vocabularies (index 0 reserved for padding / no-phoneme)
@@ -167,10 +167,15 @@ class JyutpingTokenizer:
             outs.append(flat)
         return outs
 
-    def decode(self, flat_ids: List[int], original_tokens: Optional[List[str]] = None) -> str:
+    def decode(
+        self, flat_ids: List[int], original_tokens: Optional[List[str]] = None
+    ) -> str:
         if isinstance(flat_ids[0], list):
             # batch
-            return [self.decode(x, orig) for x, orig in zip(flat_ids, original_tokens or [None] * len(flat_ids))]
+            return [
+                self.decode(x, orig)
+                for x, orig in zip(flat_ids, original_tokens or [None] * len(flat_ids))
+            ]
         L4 = len(flat_ids)
         if L4 % 4 != 0:
             raise ValueError("flat_ids length must be divisible by 4")
@@ -201,7 +206,12 @@ class JyutpingTokenizer:
         return " ".join(toks)
 
     def vocab_size(self) -> List[int]:
-        return [len(self.onset_map) + 1, len(self.nucleus_map) + 1, len(self.coda_map) + 1, len(self.tone_map) + 1]
+        return [
+            len(self.onset_map) + 1,
+            len(self.nucleus_map) + 1,
+            len(self.coda_map) + 1,
+            len(self.tone_map) + 1,
+        ]
 
     def __len__(self) -> int:
         return sum(self.vocab_size())
