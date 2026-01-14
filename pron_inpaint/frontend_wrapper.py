@@ -306,8 +306,12 @@ class InpaintFrontendWrapper:
 
         if pad_count == 0 or phoneme_str == "":
             # return a dummy phone token when no phoneme
-            phone_token = torch.tensor([[]], dtype=torch.int32).to(self.device)
-            phone_token_len = torch.tensor([0], dtype=torch.int32).to(self.device)
+            phone_token = torch.zeros(
+                (1, text_token.shape[1] * 4), dtype=torch.int32
+            ).to(self.device)
+            phone_token_len = torch.tensor(
+                [phone_token.shape[1]], dtype=torch.int32
+            ).to(self.device)
             return phone_token, phone_token_len
 
         # `tmp_phone_token` is expected to be shape [1, phoneme_count * 4]
