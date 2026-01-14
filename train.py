@@ -98,6 +98,11 @@ def parse_args():
             "This simply repeats dataset entries; no processing logic is changed."
         ),
     )
+    p.add_argument(
+        "--bf16",
+        action="store_true",
+        help="Enable bfloat16 training (uses TrainingArguments.bf16). Requires hardware support.",
+    )
     return p.parse_args()
 
 
@@ -377,13 +382,8 @@ def main():
         # shuffle again to mix the duplicates
         dataset = dataset.shuffle(seed=42)
 
-    # Use per-component vocab sizes provided by the JyutpingTokenizer and compute a single unified vocab_size
-    onset_vocab_size, nucleus_vocab_size, coda_vocab_size, tone_vocab_size = (
-        jyutoken.component_vocab_sizes()
-    )
-    vocab_size = (
-        onset_vocab_size + nucleus_vocab_size + coda_vocab_size + tone_vocab_size
-    )
+    # Use vocab sizes provided by the JyutpingTokenizer and compute a single unified vocab_size
+    vocab_size = jyutoken.vocab_size()
 
     # drop helper columns and keep phoneme_token (already numeric) from tokenize_add_label
     dataset = dataset.map(
@@ -403,7 +403,6 @@ def main():
     inpaint_model = Qwen2LMInpaint(
         qwen2lm,
         vocab_size=vocab_size,
-        d_model=896,
         composition="concat_linear",
     )
     # Initialize phone embedding weights from unified embedding
@@ -413,6 +412,12 @@ def main():
     freeze_backbone_except_inpaint(inpaint_model)
 
     # prepare Trainer
+    # warn if bf16 requested but hardware might not support it
+    if args.bf16 and not torch.cuda.is_available():
+        print(
+            "Warning: --bf16 requested but CUDA/accelerator not detected; training may fail if hardware does not support bfloat16."
+        )
+
     training_args = TrainingArguments(
         output_dir=args.output_dir,
         num_train_epochs=args.epochs,
@@ -420,6 +425,7 @@ def main():
         per_device_eval_batch_size=args.per_device_eval_batch_size,
         learning_rate=args.learning_rate,
         warmup_steps=args.warmup,
+        bf16=args.bf16,
         eval_strategy="epoch",
         save_strategy="epoch",
         logging_strategy="steps",
@@ -427,6 +433,7 @@ def main():
         save_total_limit=3,
         remove_unused_columns=False,
         label_names=["speech_token"],
+        save_safetensors=False,  # Must be False due to tied embedding in Qwen2LM
         report_to=args.report_to,
     )
 

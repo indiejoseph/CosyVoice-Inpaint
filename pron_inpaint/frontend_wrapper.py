@@ -28,6 +28,7 @@ from cosyvoice.utils.frontend_utils import (
 )
 from cosyvoice.tokenizer.tokenizer import get_qwen_tokenizer
 from cosyvoice.utils.file_utils import logging
+from pron_inpaint.tokenizer import JyutpingTokenizer
 
 if TYPE_CHECKING:
     from cosyvoice.cli.frontend import CosyVoiceFrontEnd
@@ -60,18 +61,20 @@ class InpaintFrontendWrapper:
 
     def __init__(
         self,
-        phone_tokenizer: "JyutpingTokenizer",
         frontend: Optional["CosyVoiceFrontEnd"] = None,
         tokenizer_path: Optional[str] = None,
         device=torch.device("cpu"),
     ):
         self.frontend = frontend
         self.frontend_tokenizer = None
-        self.phone_tokenizer = phone_tokenizer
+        self.phone_tokenizer = JyutpingTokenizer()
         self.text_frontend = "wetext"
         self.device = device
         self.allowed_special = "all"
         self.inflect_parser = inflect.engine()
+        self.zh_tn_model = None
+        self.en_tn_model = None
+        self.frd = None
 
         if self.frontend is not None:
             self.text_frontend = self.frontend.text_frontend
@@ -89,6 +92,10 @@ class InpaintFrontendWrapper:
                     traditional_to_simple=False,
                     remove_interjections=False,
                 )
+                self.zh_tn_model = self.frontend.zh_tn_model
+                self.en_tn_model = self.frontend.en_tn_model
+            elif self.frontend.text_frontend == "ttsfrd":
+                self.frd = self.frontend.frd
 
         else:
             if tokenizer_path is not None:
@@ -403,8 +410,8 @@ class InpaintFrontendWrapper:
             model_input = {**self.frontend.spk2info[zero_shot_spk_id]}
         model_input["text"] = tts_text_token
         model_input["text_len"] = tts_text_token_len
-        model_input["phone_token"] = tts_phone_token
-        model_input["phone_token_len"] = tts_phone_token_len
+        model_input["phone"] = tts_phone_token
+        model_input["phone_len"] = tts_phone_token_len
 
         return model_input
 

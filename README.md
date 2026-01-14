@@ -184,6 +184,8 @@ During training and inference:
 
 The resulting embedding sequence is passed unchanged through the frozen transformer layers.
 
+Note: At inference time, `Qwen2LMInpaint.inference(...)` accepts optional `phoneme_token` (shape `(B, 4*L)` or a flattened `4*P` vector with `phoneme_token_len`) which will be composed and inserted into the text embedding buffer (aligned to the non-prompt text tokens) prior to running the LM decoder.
+
 ### Multi-Syllable Words
 
 For multi-syllable words, multiple phoneme embeddings are inserted sequentially, preserving syllable order and timing.
@@ -234,6 +236,7 @@ python train.py --data dataset.csv \
 
 - **`--phoneme_keep_prob`** controls the fraction of inline Jyutping annotations inserted into the text (default: `0.25`). ✅
 - **`--dataset_factor`** repeats dataset entries to expand the dataset by that factor (default: `1`). Example: `--phoneme_keep_prob 0.25 --dataset_factor 4` will result in approximately 100% of training examples containing inline annotations. 🔁
+- **`--bf16`** enables bfloat16 training via `TrainingArguments.bf16`. Use this if your hardware and drivers support it (e.g., A100/TPU); it can reduce memory usage and improve throughput. ⚡
 - The training pipeline uses `tokenize_add_label` (to insert bracketed Jyutping) and `InpaintFrontendWrapper` (to normalize text and extract `text_token` and `phoneme_token`). 🔧
 - If your dataset is a CSV, **`pandas`** is required by `train.py` to load it.
 - Make sure the CosyVoice submodule is initialized before running: `git submodule update --init --recursive`. ⚠️

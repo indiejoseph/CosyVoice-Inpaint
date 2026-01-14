@@ -221,15 +221,6 @@ class JyutpingTokenizer:
                 toks.append(tok if tok != "" else "[UNK]")
         return " ".join(toks)
 
-    def component_vocab_sizes(self) -> Tuple[int, int, int, int]:
-        """Return per-component vocab sizes including padding idx 0: (onset, nucleus, coda, tone)"""
-        return (
-            len(self.onset_map) + 1,
-            len(self.nucleus_map) + 1,
-            len(self.coda_map) + 1,
-            len(self.tone_map) + 1,
-        )
-
     def vocab_size(self) -> int:
         """Total phoneme vocab size (sum of component sizes, including pad idx 0)."""
         return TOTAL_PHONEME_VOCAB
