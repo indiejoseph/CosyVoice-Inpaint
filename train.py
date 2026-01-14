@@ -22,6 +22,7 @@ import sys
 from typing import Any, Dict, List, Optional
 
 import torch
+import torch.nn.functional as F
 from datasets import load_dataset, load_from_disk, Dataset
 from torch.nn.utils.rnn import pad_sequence
 from transformers import (
@@ -40,6 +41,8 @@ from cosyvoice.llm.llm import Qwen2LM
 
 # Our inpaint implementation
 from pron_inpaint.modeling import Qwen2LMInpaint
+from pron_inpaint.frontend_wrapper import InpaintFrontendWrapper
+from pron_inpaint.tokenizer import JyutpingTokenizer
 
 
 def parse_args():
@@ -80,6 +83,21 @@ def parse_args():
         default="none",
         help="Reporting backend for Trainer (e.g., 'none' or 'wandb')",
     )
+    p.add_argument(
+        "--warmup",
+        type=int,
+        default=1000,
+        help="Number of warmup steps for the optimizer (passed to Transformers TrainingArguments)",
+    )
+    p.add_argument(
+        "--dataset_factor",
+        type=int,
+        default=1,
+        help=(
+            "Factor to repeat the dataset (e.g., 4 to expand the dataset 4x). "
+            "This simply repeats dataset entries; no processing logic is changed."
+        ),
+    )
     return p.parse_args()
 
 
@@ -94,33 +112,35 @@ class CustomDataCollatorWithPadding:
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
         text_tokens = [torch.LongTensor(f["text_token"]) for f in features]
         text_lens = [len(t) for t in text_tokens]
+
+        # Speech padding
+        speech_tokens = [torch.LongTensor(f["speech_token"]) for f in features]
+        speech_lens = [len(s) for s in speech_tokens]
+
+        # phoneme_token is pre-flattened into space-separated ints per example
+        # Use simple pad_sequence on the flattened vectors and expose phoneme_token_len
+        phoneme_tensors = [torch.LongTensor(f["phoneme_token"]) for f in features]
+        phoneme_flat = pad_sequence(phoneme_tensors, batch_first=True, padding_value=0)
+        phoneme_lens = [int(len(f["phoneme_token"]) // 4) for f in features]
+
         batch = {
             "text_token": pad_sequence(
                 text_tokens, batch_first=True, padding_value=151643
             ),
             "text_token_len": torch.LongTensor(text_lens),
             "speech_token": pad_sequence(
-                [torch.LongTensor(f["speech_token"]) for f in features],
-                batch_first=True,
-                padding_value=self.num_speech_tokens,
+                speech_tokens, batch_first=True, padding_value=self.num_speech_tokens
             ),
-            "speech_token_len": torch.LongTensor(
-                [len(f["speech_token"]) for f in features]
-            ),
-            # phoneme_token is pre-flattened into space-separated ints per example
-            "phoneme_token": pad_sequence(
-                [torch.LongTensor(f["phoneme_token"]) for f in features],
-                batch_first=True,
-                padding_value=0,
-            ),
+            "speech_token_len": torch.LongTensor(speech_lens),
+            "phoneme_token": phoneme_flat,
+            "phoneme_token_len": torch.LongTensor(phoneme_lens),
         }
         return batch
 
 
 class CustomTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        # Model now supports **inputs directly via the updated modeling.py
-        outputs = model(**inputs)
+        outputs = model(inputs, device=self.args.device)
 
         if isinstance(outputs, dict) and "loss" in outputs:
             loss = outputs["loss"]
@@ -177,7 +197,7 @@ def build_qwen2lm(qwen_config_path: str, llm_state: Optional[str] = None):
 
     # optionally load llm state
     if llm_state is not None:
-        state = torch.load(llm_state, map_location="cpu")
+        state = torch.load(llm_state, map_location="cpu", weights_only=False)
         qwen2lm.load_state_dict(state)
 
     return qwen2lm
@@ -188,14 +208,24 @@ def freeze_backbone_except_inpaint(inpaint_model: Qwen2LMInpaint):
     for n, p in inpaint_model.qwen2lm.named_parameters():
         p.requires_grad = False
     # Ensure inpaint module params are trainable
-    for p in inpaint_model.onset_emb.parameters():
-        p.requires_grad = True
-    for p in inpaint_model.nucleus_emb.parameters():
-        p.requires_grad = True
-    for p in inpaint_model.coda_emb.parameters():
-        p.requires_grad = True
-    for p in inpaint_model.tone_emb.parameters():
-        p.requires_grad = True
+    # unified phone embedding
+    if hasattr(inpaint_model, "phone_emb"):
+        for p in inpaint_model.phone_emb.parameters():
+            p.requires_grad = True
+    else:
+        # fallback to old per-component attributes if present
+        if hasattr(inpaint_model, "onset_emb"):
+            for p in inpaint_model.onset_emb.parameters():
+                p.requires_grad = True
+        if hasattr(inpaint_model, "nucleus_emb"):
+            for p in inpaint_model.nucleus_emb.parameters():
+                p.requires_grad = True
+        if hasattr(inpaint_model, "coda_emb"):
+            for p in inpaint_model.coda_emb.parameters():
+                p.requires_grad = True
+        if hasattr(inpaint_model, "tone_emb"):
+            for p in inpaint_model.tone_emb.parameters():
+                p.requires_grad = True
     if hasattr(inpaint_model, "composer") and inpaint_model.composer is not None:
         for p in inpaint_model.composer.parameters():
             p.requires_grad = True
@@ -236,7 +266,6 @@ def main():
 
     import random
 
-    tokenizer = AutoTokenizer.from_pretrained(args.qwen_config)
     # instantiate a JyutpingTokenizer for parsing phoneme annotations
     jyutoken = JyutpingTokenizer()
 
@@ -271,61 +300,89 @@ def main():
                 tone[i] = 0
         return onset + nucleus + coda + tone
 
-    def tokenize_add_label(sample):
-        # Tokenize without adding special tokens so token count matches whitespace-split phone tokens
-        text_tokens = tokenizer.encode(sample["text"], add_special_tokens=False)
-        L = len(text_tokens)
-        # speech tokens may already be a list or a space-separated string
-        speech_token = sample.get("speech_tokens", [])
-        if isinstance(speech_token, str):
-            speech_token = convert_to_list(speech_token)
-        try:
-            phon_flat_full = jyutoken.encode([sample.get("phone", "")])[0]
-        except Exception:
-            # return consistent keys so map writer doesn't fail; mark invalid
-            return {
-                "text_token": text_tokens,
-                "speech_token": speech_token,
-                "phoneme_token": [0] * (4 * L),
-                "valid_phon": False,
-            }
-        # validate phon_flat_full length before masking; reject if mismatch
-        if len(phon_flat_full) != 4 * L:
-            return {
-                "text_token": text_tokens,
-                "speech_token": speech_token,
-                "phoneme_token": [0] * (4 * L),
-                "valid_phon": False,
-            }
-        # apply masking to keep only a fraction of phoneme components
-        phon_flat = (
-            _mask_phon_flat(
-                phon_flat_full,
-                L,
-                args.phoneme_keep_prob,
-                args.phoneme_seed,
-                sample.get("text", ""),
-            )
-            if args.phoneme_keep_prob < 1.0
-            else phon_flat_full
-        )
-        return {
-            "text_token": text_tokens,
-            "speech_token": speech_token,
-            "phoneme_token": phon_flat,
-            "valid_phon": True,
-        }
+    # Use the reusable tokenize_add_label implementation from pron_inpaint.utils
+    from pron_inpaint.utils import tokenize_add_label
 
+    # First pass: insert bracketed Jyutping tokens into raw text according to `--phoneme_keep_prob`
     dataset = ds.map(
         tokenize_add_label,
+        fn_kwargs={
+            "insert_prob": args.phoneme_keep_prob,
+            "seed": args.phoneme_seed,
+        },
         remove_columns=list(ds.features) if hasattr(ds, "features") else None,
         num_proc=12,
     )
+
+    # keep only examples that had a parsable phone annotation
     dataset = dataset.filter(lambda ex: ex.get("valid_phon", False), num_proc=12)
 
-    # Use vocab sizes provided by the JyutpingTokenizer
+    # Second pass (single-process): use the InpaintFrontendWrapper to normalize the
+    # text and extract `text_token` and `phoneme_token` buffers aligned to text tokens.
+    def _apply_frontend(ex, tokenizer_path=None):
+        # Local imports to avoid pickling issues when using dataset.map in parallel
+        from pron_inpaint.tokenizer import JyutpingTokenizer
+
+        # Cache frontend wrapper on the function object to avoid instantiating it for
+        # every example (expensive). This is safe when running with num_proc=1.
+        if not hasattr(_apply_frontend, "_fw") or _apply_frontend._fw is None:
+            phone_tokenizer = JyutpingTokenizer()
+            _apply_frontend._fw = InpaintFrontendWrapper(
+                phone_tokenizer=phone_tokenizer, tokenizer_path=tokenizer_path
+            )
+        fw = _apply_frontend._fw
+
+        text_with = ex.get("text_with_jyutping", ex.get("text", ""))
+        # Normalize without splitting to keep one segment
+        norm_text = fw.text_normalize(text_with, split=False, text_frontend=True)
+        text_token, _ = fw._extract_text_token(norm_text)
+        phone_token, _ = fw._extract_phone_token(norm_text, text_token)
+
+        text_tokens_list = text_token[0].tolist() if text_token.numel() > 0 else []
+        phone_tokens_list = phone_token[0].tolist() if phone_token.numel() > 0 else []
+
+        return {
+            "text_token": text_tokens_list,
+            "speech_token": ex.get("speech_token", ex.get("speech_tokens", [])),
+            "phoneme_token": phone_tokens_list,
+            "valid_phon": True if len(phone_tokens_list) > 0 else False,
+        }
+
+    dataset = dataset.map(
+        _apply_frontend,
+        fn_kwargs={"tokenizer_path": args.qwen_config},
+        # keep only the columns we need downstream
+        remove_columns=[
+            c
+            for c in dataset.column_names
+            if c not in ("text_token", "speech_token", "phoneme_token", "valid_phon")
+        ],
+        num_proc=1,
+    )
+
+    # Final filter: ensure we actually produced phoneme buffers aligned to the text
+    dataset = dataset.filter(lambda ex: ex.get("valid_phon", False), num_proc=12)
+
+    # Optionally expand the dataset by repeating entries `dataset_factor` times. This is a
+    # straightforward way to increase the effective coverage of inserted phonemes (e.g., with
+    # insert_prob=0.25 and dataset_factor=4, the expanded dataset will contain ~100% annotated examples).
+    if (
+        hasattr(args, "dataset_factor")
+        and args.dataset_factor
+        and args.dataset_factor > 1
+    ):
+        from datasets import concatenate_datasets
+
+        dataset = concatenate_datasets([dataset] * int(args.dataset_factor))
+        # shuffle again to mix the duplicates
+        dataset = dataset.shuffle(seed=42)
+
+    # Use per-component vocab sizes provided by the JyutpingTokenizer and compute a single unified vocab_size
     onset_vocab_size, nucleus_vocab_size, coda_vocab_size, tone_vocab_size = (
-        jyutoken.vocab_size()
+        jyutoken.component_vocab_sizes()
+    )
+    vocab_size = (
+        onset_vocab_size + nucleus_vocab_size + coda_vocab_size + tone_vocab_size
     )
 
     # drop helper columns and keep phoneme_token (already numeric) from tokenize_add_label
@@ -345,14 +402,12 @@ def main():
     qwen2lm = build_qwen2lm(args.qwen_config, llm_state=args.llm_state)
     inpaint_model = Qwen2LMInpaint(
         qwen2lm,
-        onset_vocab=onset_vocab_size,
-        nucleus_vocab=nucleus_vocab_size,
-        coda_vocab=coda_vocab_size,
-        tone_vocab=tone_vocab_size,
+        vocab_size=vocab_size,
         d_model=896,
         composition="concat_linear",
-        gate_blend=False,
     )
+    # Initialize phone embedding weights from unified embedding
+    inpaint_model.init_component_from_text_embed()
 
     # freeze backbone and leave inpaint params trainable
     freeze_backbone_except_inpaint(inpaint_model)
@@ -364,10 +419,11 @@ def main():
         per_device_train_batch_size=args.per_device_train_batch_size,
         per_device_eval_batch_size=args.per_device_eval_batch_size,
         learning_rate=args.learning_rate,
+        warmup_steps=args.warmup,
         eval_strategy="epoch",
         save_strategy="epoch",
         logging_strategy="steps",
-        logging_steps=100,
+        logging_steps=10,
         save_total_limit=3,
         remove_unused_columns=False,
         label_names=["speech_token"],

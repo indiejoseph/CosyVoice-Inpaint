@@ -11,9 +11,9 @@ and provides:
 
 Notes / API conventions (deliberately simple to start):
 - Batch-level expected keys (optional):
-  - `phoneme_token` with shape `(B, 4 * L)` where `L` is the `text_token` length. The layout is grouped by component:
-    `[onset_0, ..., onset_{L-1}, nucleus_0, ..., nucleus_{L-1}, coda_0, ..., coda_{L-1}, tone_0, ..., tone_{L-1}]`.
-    The implementation will split this into four `(B, L)` component tensors `(onset, nucleus, coda, tone)`. An index of `0` means "no phoneme".
+  - `phoneme_token` with shape `(B, 4 * L)` where `L` is the `text_token` length. The layout is interleaved per token:
+    `[onset_0, nucleus_0, coda_0, tone_0, onset_1, nucleus_1, coda_1, tone_1, ...]`.
+    The implementation will rearrange this into four `(B, L)` component tensors `(onset, nucleus, coda, tone)`. An index of `0` means "no phoneme".
   - If this key is absent, behavior falls back to standard Qwen2LM forward.
 - Multi-syllable insertion (multiple phoneme embeddings per text token)
   is *not* supported by this initial implementation. It is documented and may
@@ -31,110 +31,121 @@ class Qwen2LMInpaint(nn.Module):
 
     Args:
         qwen2lm: an instantiated Qwen2LM (or CosyVoice3LM) from third_party/CosyVoice
-        onset_vocab: size of onset vocab (include 0 for "no onset")
-        nucleus_vocab: likewise for nucleus
-        coda_vocab: likewise for coda
-        tone_vocab: likewise for tone
+        vocab_size: total phoneme vocabulary size (includes pad=0 and covers all components)
         d_model: embedding dimension (should match qwen2lm.llm_input_size)
         composition: one of {'concat_linear', 'sum'} (default 'concat_linear')
-        gate_blend: if True, use a learned gate to blend phoneme and text embeddings
     """
 
     def __init__(
         self,
         qwen2lm,
-        onset_vocab: int,
-        nucleus_vocab: int,
-        coda_vocab: int,
-        tone_vocab: int,
+        vocab_size: int,
         d_model: int,
         composition: str = "concat_linear",
-        gate_blend: bool = False,
     ):
+        """Note: `vocab_size` must be the total phoneme vocabulary size including pad idx 0.
+        For example: vocab_size = (n_onset + n_nucleus + n_coda + n_tone + 1)
+        """
         super().__init__()
         self.qwen2lm = qwen2lm
         self.d_model = d_model
         assert composition in ("concat_linear", "sum")
         self.composition = composition
-        self.gate_blend = gate_blend
 
-        # component embedding tables. index 0 is reserved as "no phoneme" / padding
-        self.onset_emb = nn.Embedding(onset_vocab, d_model, padding_idx=0)
-        self.nucleus_emb = nn.Embedding(nucleus_vocab, d_model, padding_idx=0)
-        self.coda_emb = nn.Embedding(coda_vocab, d_model, padding_idx=0)
-        self.tone_emb = nn.Embedding(tone_vocab, d_model, padding_idx=0)
-
+        # unified phoneme embedding table: index 0 is reserved as "no phoneme" / padding
+        total_vocab = vocab_size
+        self.phone_emb = nn.Embedding(total_vocab, d_model, padding_idx=0)
+        self.composer = torch.nn.Identity()
         if composition == "concat_linear":
             self.composer = nn.Sequential(
                 nn.Linear(4 * d_model, d_model),
                 nn.GELU(),
                 nn.Linear(d_model, d_model),
             )
-        else:
-            self.composer = None
-
-        if gate_blend:
-            # gate takes [text_emb, phoneme_emb] -> scalar in (0,1)
-            self.gate = nn.Sequential(
-                nn.Linear(2 * d_model, d_model), nn.GELU(), nn.Linear(d_model, d_model)
-            )
 
     def compose_phoneme(
-        self,
-        onset: torch.LongTensor,
-        nucleus: torch.LongTensor,
-        coda: torch.LongTensor,
-        tone: torch.LongTensor,
-    ) -> torch.Tensor:
-        """Compose phoneme embeddings per token.
+        self, phoneme_flat: torch.LongTensor, phoneme_token_len: torch.LongTensor = None
+    ) -> tuple:
+        """Compose phoneme embeddings from a flattened phoneme id tensor.
 
-        Inputs are expected to be LongTensors of shape (B, L). Returns a FloatTensor
-        (B, L, d_model).
+        Args:
+            phoneme_flat: LongTensor of shape (B, 4*L) where the layout is interleaved per token:
+                [onset_0, nucleus_0, coda_0, tone_0, onset_1, nucleus_1, ...]
+            phoneme_token_len: optional (B,) unpadded per-sample text token lengths
+
+        Returns:
+            tuple((B, L, d_model) composed phoneme embeddings, (B, L) boolean mask indicating which token positions contain any phoneme component)
+
+        Behavior:
+            If `phoneme_token_len` is provided, the method will reconstruct a
+            (B, 4, Lmax) per-component buffer by slicing each sample's first
+            `4 * Li` entries and placing them into the buffer. This supports
+            batched inputs where `phoneme_flat` was padded via `pad_sequence()`
+            (i.e., tail padding on the flattened vector).
         """
-        # lookup component embeddings -> (B, L, D)
-        on = self.onset_emb(onset)
-        nu = self.nucleus_emb(nucleus)
-        co = self.coda_emb(coda)
-        to = self.tone_emb(tone)
+        if phoneme_flat.dim() != 2:
+            raise ValueError("phoneme_flat must be shape (B, 4*L)")
+        B, PT_len = phoneme_flat.shape
+        if PT_len % 4 != 0:
+            raise ValueError("phoneme_flat second dimension must be divisible by 4")
+        L = PT_len // 4
+
+        # Reconstruct per-component tensor (expect interleaved per-token format)
+        if phoneme_token_len is not None:
+            if phoneme_token_len.dim() != 1 or phoneme_token_len.numel() != B:
+                raise ValueError(
+                    "phoneme_token_len must be shape (B,) matching batch size"
+                )
+            Lmax = L
+            pf4 = torch.zeros(
+                (B, 4, Lmax), dtype=phoneme_flat.dtype, device=phoneme_flat.device
+            )
+            for i in range(B):
+                Li = int(phoneme_token_len[i].item())
+                if Li < 0 or Li > Lmax:
+                    raise ValueError(
+                        "phoneme_token_len values must be between 0 and Lmax"
+                    )
+                if 4 * Li > PT_len:
+                    raise ValueError(
+                        "phoneme_flat too short for declared phoneme_token_len"
+                    )
+                if Li > 0:
+                    seg = phoneme_flat[i, : 4 * Li]  # shape (4*Li,)
+                    seg = seg.view(Li, 4)  # (Li,4) -> per-token [on,nuc,co,to]
+                    pf4[i, :, :Li] = seg.t()  # transpose to (4,Li)
+            pf_flat = pf4.view(B, 4 * Lmax)
+            emb = self.phone_emb(pf_flat)
+        else:
+            # assume phoneme_flat is arranged interleaved per token:
+            # [onset_0, nucleus_0, coda_0, tone_0, onset_1, ...]
+            pf4 = phoneme_flat.view(B, L, 4).permute(0, 2, 1)  # (B,4,L)
+            pf_flat = pf4.reshape(B, 4 * L)
+            emb = self.phone_emb(pf_flat)
+
+        # reshape to (B, 4, L, D) so we can split components
+        emb = emb.view(B, 4, L, -1)
+        # (B,4,L,D) ordering is now explicit
+        on = emb[:, 0, :, :]
+        nu = emb[:, 1, :, :]
+        co = emb[:, 2, :, :]
+        to = emb[:, 3, :, :]
 
         if self.composition == "sum":
             out = on + nu + co + to
         else:  # concat_linear
             cat = torch.cat([on, nu, co, to], dim=-1)
             out = self.composer(cat)
-        return out
 
-    def replace_text_embeddings(
-        self,
-        text_emb: torch.Tensor,
-        onset: torch.LongTensor,
-        nucleus: torch.LongTensor,
-        coda: torch.LongTensor,
-        tone: torch.LongTensor,
-    ) -> torch.Tensor:
-        """Return `text_emb` with phoneme-composed embeddings replacing selected tokens.
-
-        Replacement mask: positions where any component index != 0.
-        """
-        composed = self.compose_phoneme(onset, nucleus, coda, tone)
-        # mask positions where any component is non-zero
-        mask = (onset != 0) | (nucleus != 0) | (coda != 0) | (tone != 0)
-        mask = mask.unsqueeze(-1)  # (B, L, 1)
-
-        if self.gate_blend:
-            gate_in = torch.cat([text_emb, composed], dim=-1)
-            gate = torch.sigmoid(self.gate(gate_in))  # (B, L, D)
-            blended = gate * composed + (1.0 - gate) * text_emb
-            out = torch.where(mask, blended, text_emb)
-        else:
-            out = torch.where(mask, composed, text_emb)
-        return out
+        # pf_mask: (B, L) True where any component != 0
+        pf_mask = (pf4 != 0).any(dim=1)
+        return out, pf_mask
 
     def forward(self, batch: dict, device: torch.device):
         """A drop-in forward that mirrors `Qwen2LM.forward` but supports per-token phoneme replacement.
 
         Optional batch keys (see class docstring):
-        - `phoneme_token` (LongTensor `(B, 4*L)`) containing grouped components `[onset..., nucleus..., coda..., tone...]`.
+        - `phoneme_token` (LongTensor `(B, 4*L)`) containing interleaved per-token components `[onset_0, nucleus_0, coda_0, tone_0, onset_1, ...]`.
 
         Behavior: if `phoneme_token` is present, it will be split into four `(B, L)` tensors
         and used to compute composed phoneme embeddings which replace the corresponding
@@ -149,7 +160,7 @@ class Qwen2LMInpaint(nn.Module):
         # 1. encode text_token
         text_token_emb = self.qwen2lm.llm.model.model.embed_tokens(text_token)
 
-        # if a merged phoneme_token is provided, split it into components and replace per-token embeddings
+        # if a merged phoneme_token is provided, split it into components and integrate phoneme embeddings
         if "phoneme_token" in batch and batch["phoneme_token"] is not None:
             phoneme_token = batch["phoneme_token"].to(device)
             if phoneme_token.dim() != 2:
@@ -160,20 +171,29 @@ class Qwen2LMInpaint(nn.Module):
                 raise ValueError(
                     "`phoneme_token` second dimension must equal 4 * text_token length"
                 )
-            L = text_len
-            # layout: [onset_0..onset_{L-1}, nucleus_0..nucleus_{L-1}, coda_0..coda_{L-1}, tone_0..tone_{L-1}]
-            onset = phoneme_token[:, 0:L]
-            nucleus = phoneme_token[:, L : 2 * L]
-            coda = phoneme_token[:, 2 * L : 3 * L]
-            tone = phoneme_token[:, 3 * L : 4 * L]
-            # ensure shapes are (B, L)
-            if onset.shape != text_token.shape:
-                raise ValueError(
-                    "`phoneme_token` should split into (B, L) component tensors matching `text_token.shape`"
-                )
-            text_token_emb = self.replace_text_embeddings(
-                text_token_emb, onset, nucleus, coda, tone
-            )
+            phoneme_token_len = batch.get("phoneme_token_len", None)
+            if phoneme_token_len is not None:
+                phoneme_token_len = phoneme_token_len.to(device)
+                if phoneme_token_len.dim() != 1 or phoneme_token_len.numel() != B:
+                    raise ValueError(
+                        "`phoneme_token_len` must be shape (B,) matching batch size"
+                    )
+                if (phoneme_token_len > text_len).any():
+                    raise ValueError(
+                        "`phoneme_token_len` values must be <= text_token length (padded)"
+                    )
+
+            # Compose phoneme embeddings (returns composed (B, L, D) and a mask pf_mask (B, L))
+            composed, pf_mask = self.compose_phoneme(phoneme_token, phoneme_token_len)
+
+            # Zero out text embeddings at phoneme-inpainted positions
+            text_token_emb = text_token_emb * (~pf_mask).unsqueeze(-1).float()
+
+            # Ensure composed is zero where no components exist
+            composed = composed * pf_mask.unsqueeze(-1).float()
+
+            # Final per-token embedding is text + composed phoneme (text zeros at phoneme slots)
+            text_token_emb = text_token_emb + composed
 
         # 3. sos and task_id
         sos_emb = self.qwen2lm.llm_embedding.weight[self.qwen2lm.sos].reshape(1, 1, -1)
@@ -221,14 +241,16 @@ class Qwen2LMInpaint(nn.Module):
 
     # small utility: initialize component embeddings from the average text embedding
     def init_component_from_text_embed(self):
-        """Initialize phoneme component embeddings to the average token embedding of the LLM's tokenizer.
+        """Initialize phoneme component embeddings from the average token embedding of the LLM's tokenizer.
 
         This helps keep composed embeddings on-manifold as a simple heuristic.
         """
         with torch.no_grad():
             text_emb_weights = self.qwen2lm.llm.model.model.embed_tokens.weight
             avg = text_emb_weights.mean(dim=0)
-            for emb in (self.onset_emb, self.nucleus_emb, self.coda_emb, self.tone_emb):
-                nn.init.normal_(emb.weight, mean=0.0, std=0.02)
-                emb.weight.data[0].zero_()  # keep padding idx zero
-                emb.weight.data[1:] += avg.unsqueeze(0)
+            # init unified phone embedding: random noise then add avg to non-pad entries
+            nn.init.normal_(self.phone_emb.weight, mean=0.0, std=0.02)
+            self.phone_emb.weight.data[0].zero_()  # keep padding idx zero
+            # Ensure we don't exceed phone_emb's size when adding avg
+            if self.phone_emb.weight.data.shape[0] > 1:
+                self.phone_emb.weight.data[1:] += avg.unsqueeze(0)

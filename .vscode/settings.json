@@ -1,0 +1,6 @@
+{
+  "python.analysis.extraPaths": [
+    "${workspaceFolder}/third_party/CosyVoice",
+    "${workspaceFolder}/third_party/CosyVoice/third_party/Matcha-TTS"
+  ]
+}

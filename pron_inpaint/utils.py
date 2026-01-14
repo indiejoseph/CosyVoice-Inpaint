@@ -104,3 +104,137 @@ def align_text_and_tokens(
             char_to_tokens[c].append(tidx)
         cursor = end
     return token_spans, char_to_tokens
+
+
+def tokenize_add_label(
+    sample: dict,
+    insert_prob: float = 0.25,
+    seed: int = 42,
+) -> dict:
+    """Prepare sample by randomly inserting bracketed Jyutping annotations into text.
+
+    New behavior (used prior to frontend processing):
+      - If `sample["phone"]` is present and parsable, deterministically sample which
+        syllables to reveal (insert) according to `insert_prob` and `seed`.
+      - Construct `text_with_jyutping` which contains inline bracketed annotations
+        (e.g., "你好[aa3]！"). This string will be consumed by the `InpaintFrontendWrapper`
+        later to produce `text_token` and `phoneme_token` buffers.
+
+    Returns a dict (kept simple so it is safe to run in dataset.map workers):
+        - `text`: original text (unchanged)
+        - `text_with_jyutping`: text with inserted bracketed tokens
+        - `speech_token`: original speech tokens (if present)
+        - `phone`: original phone string
+        - `valid_phon`: True if `phone` was present and parsed into syllables, False otherwise
+
+    Notes:
+      - This function intentionally does not perform tokenization; the frontend wrapper
+        will handle tokenization and alignment in a second mapping step (single-process)
+        to avoid pickling heavy tokenizer/frontend objects across workers.
+    """
+    text = sample.get("text", "")
+    speech_token = sample.get("speech_tokens", sample.get("speech_token", []))
+    if isinstance(speech_token, str):
+        speech_token = [int(i) for i in speech_token.split() if i != ""]
+
+    phone_str = (sample.get("phone", "") or "").strip()
+
+    # Quick reject if no phone annotation is present
+    if phone_str == "":
+        return {
+            "text": text,
+            "text_with_jyutping": text,
+            "speech_token": speech_token,
+            "phone": phone_str,
+            "valid_phon": False,
+        }
+
+    # Try to obtain list of jyutping syllables (simple whitespace split)
+    sylls = [p for p in phone_str.split() if p != ""]
+    if len(sylls) == 0:
+        return {
+            "text": text,
+            "text_with_jyutping": text,
+            "speech_token": speech_token,
+            "phone": phone_str,
+            "valid_phon": False,
+        }
+
+    # Deterministic RNG seeded with sample text and provided seed.
+    # Use a stable SHA-256-based integer derived from text+phone to avoid Python's
+    # randomized `hash()` which varies per process and can break determinism.
+    import random as _rand
+    import hashlib
+
+    key_str = (text or "") + "|" + (phone_str or "")
+    stable_hash = int.from_bytes(
+        hashlib.sha256(key_str.encode("utf-8")).digest()[:8], "little"
+    )
+    rng = _rand.Random(seed ^ (stable_hash & 0xFFFFFFFF))
+
+    # Attempt word-wise insertion if counts match; otherwise fallback to best-effort
+    words = [w for w in list(text) if w != ""]
+
+    if len(words) == len(sylls) and len(words) > 0:
+        # Insert syllables after corresponding words according to insert_prob
+        new_words = []
+        for w, s in zip(words, sylls):
+            if rng.random() < insert_prob and s not in [".", ",", "!", "?"]:
+                new_words.append(f"{w}[{s}]")
+            else:
+                new_words.append(w)
+
+        # Rebuild text preserving original surrounding whitespace as best-effort
+        # We replace the first occurrence of each word in sequence to avoid altering later duplicates.
+        new_text = text
+        cursor = 0
+        for orig_w, new_w, s in zip(words, new_words, sylls):
+            found = new_text.find(orig_w, cursor)
+            if found == -1:
+                found = new_text.find(orig_w)
+            if found != -1:
+                new_text = (
+                    new_text[: found + len(orig_w)]
+                    + (f"[{s}]" if new_w != orig_w else "")
+                    + new_text[found + len(orig_w) :]
+                )
+                cursor = found + len(new_w)
+    else:
+        # Fallback: map syllables to first N non-space characters or first N words
+        nonspace_chars = [i for i, c in enumerate(text) if not c.isspace()]
+        if len(nonspace_chars) == len(sylls) and len(sylls) > 0:
+            # Insert after characters
+            chars = list(text)
+            offset = 0
+            for j, s in enumerate(sylls):
+                if rng.random() < insert_prob:
+                    idx = nonspace_chars[j] + 1 + offset
+                    chars.insert(idx, f"[{s}]")
+                    offset += 1
+            new_text = "".join(chars)
+        else:
+            # Best-effort: annotate up to min(len(words), len(sylls)) words
+            new_text = text
+            K = min(len(words), len(sylls))
+            cursor = 0
+            for j in range(K):
+                w = words[j]
+                s = sylls[j]
+                if rng.random() < insert_prob:
+                    found = new_text.find(w, cursor)
+                    if found == -1:
+                        found = new_text.find(w)
+                    if found != -1:
+                        insert_pos = found + len(w)
+                        new_text = (
+                            new_text[:insert_pos] + f"[{s}]" + new_text[insert_pos:]
+                        )
+                        cursor = insert_pos + len(s) + 2
+
+    return {
+        "text": text,
+        "text_with_jyutping": new_text,
+        "speech_token": speech_token,
+        "phone": phone_str,
+        "valid_phon": True,
+    }

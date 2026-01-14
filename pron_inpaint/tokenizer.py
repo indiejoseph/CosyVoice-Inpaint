@@ -25,6 +25,14 @@ NUCLEUS_MAP = {v: i + 1 for i, v in enumerate(NUCLEUSES)}
 CODA_MAP = {v: i + 1 for i, v in enumerate(CODAS)}
 TONE_MAP = {v: i + 1 for i, v in enumerate(TONES)}
 
+# Offsets for composing a single global phoneme id space (pad=0 reserved)
+ONSET_OFFSET = 0
+NUCLEUS_OFFSET = len(ONSETS)
+CODA_OFFSET = NUCLEUS_OFFSET + len(NUCLEUSES)
+TONE_OFFSET = CODA_OFFSET + len(CODAS)
+# total vocab size (including pad=0)
+TOTAL_PHONEME_VOCAB = TONE_OFFSET + len(TONES) + 1  # +1 for pad index 0
+
 # regex to detect a simple jyutping token like 'aa3' or 'gwong2'
 _JYUTPING_RE = re.compile(r"^[a-zA-Z]+[1-9]$")
 
@@ -108,30 +116,41 @@ def components_to_ids(
 
 
 def convert_phone_str_to_flat_ids(phone_str: str, L: int) -> List[int]:
-    """Parse phone_str and return flattened 4*L ids: [onset..., nucleus..., coda..., tone...].
+    """Parse phone_str and return flattened 4*L ids in a single global id space:
+    [onset1..onsetL, nucleus1..nucleusL (offsetted), coda1..codaL (offsetted), tone1..toneL (offsetted)].
 
+    This ensures phoneme ids are unique across components. Pad/index 0 remains reserved.
     Raises ValueError on length mismatch or None phone_str.
     """
     onset_l, nucleus_l, coda_l, tone_l = parse_phone_str(phone_str, L)
     onset_ids, nucleus_ids, coda_ids, tone_ids = components_to_ids(
         onset_l, nucleus_l, coda_l, tone_l
     )
-    return onset_ids + nucleus_ids + coda_ids + tone_ids
+
+    # apply offsets to make unique ids in single space
+    def _offset_list(lst: List[int], offset: int) -> List[int]:
+        return [i + offset if i != 0 else 0 for i in lst]
+
+    onset_global = _offset_list(onset_ids, ONSET_OFFSET)
+    nucleus_global = _offset_list(nucleus_ids, NUCLEUS_OFFSET)
+    coda_global = _offset_list(coda_ids, CODA_OFFSET)
+    tone_global = _offset_list(tone_ids, TONE_OFFSET)
+    return onset_global + nucleus_global + coda_global + tone_global
 
 
 class JyutpingTokenizer:
     """Tokenizer for Jyutping phoneme strings.
 
-    Interface inspired by HuggingFace tokenizers (lightweight):
+    Interface:
     - tokenize(list[str]) -> list[list[str]]
-    - encode(list[str]) -> list[list[int]]  # flattened 4*L ids
+    - encode(list[str]) -> list[list[int]]  # flattened 4*L global ids (offsetted across components)
     - decode(flat_ids: List[int], original_tokens: Optional[List[str]] = None) -> str
-    - vocab_size() -> [onset_size, nucleus_size, coda_size, tone_size]
-    - __len__ returns total vocab size (sum)
+    - vocab_size() -> int  # total phoneme vocab size including pad
+    - component_vocab_sizes() -> Tuple[int,int,int,int]  # per-component vocab sizes including pad
 
     Notes:
     - Unknown tokens or punctuation map to id 0 (pad/UNK)
-    - `encode` works on a list of input strings and returns a list of flattened id lists
+    - `encode` now returns globalized ids where each component uses a distinct id range
     - `decode` reconstructs tokens from ids. If `original_tokens` is provided it will be
       used to recover non-phoneme tokens (punctuation) where all component ids == 0.
     """
@@ -152,18 +171,16 @@ class JyutpingTokenizer:
         return [[t for t in s.strip().split()] for s in texts]
 
     def encode(self, texts: List[str]) -> List[List[int]]:
+        """Encode a list of jyutping strings into flattened global ids (4*L per example).
+
+        Each example maintains the component grouping but component ids are offset so
+        they are unique across component types.
+        """
         outs = []
         for s in texts:
             toks = s.strip().split()
             L = len(toks)
-            onset_ids, nucleus_ids, coda_ids, tone_ids = [], [], [], []
-            for tok in toks:
-                o, n, c, t = parse_jyutping_token(tok)
-                onset_ids.append(self.onset_map.get(o, 0))
-                nucleus_ids.append(self.nucleus_map.get(n, 0))
-                coda_ids.append(self.coda_map.get(c, 0))
-                tone_ids.append(self.tone_map.get(t, 0))
-            flat = onset_ids + nucleus_ids + coda_ids + tone_ids
+            flat = convert_phone_str_to_flat_ids(s, L)
             outs.append(flat)
         return outs
 
@@ -186,10 +203,14 @@ class JyutpingTokenizer:
         t_ids = flat_ids[3 * L : 4 * L]
         toks = []
         for i in range(L):
-            o = self.onset_inv.get(o_ids[i], "")
-            n = self.nucleus_inv.get(n_ids[i], "")
-            c = self.coda_inv.get(c_ids[i], "")
-            t = self.tone_inv.get(t_ids[i], "")
+            # global ids: convert back to per-component local ids before lookup
+            def _local(gid, offset):
+                return gid - offset if gid != 0 else 0
+
+            o = self.onset_inv.get(_local(o_ids[i], ONSET_OFFSET), "")
+            n = self.nucleus_inv.get(_local(n_ids[i], NUCLEUS_OFFSET), "")
+            c = self.coda_inv.get(_local(c_ids[i], CODA_OFFSET), "")
+            t = self.tone_inv.get(_local(t_ids[i], TONE_OFFSET), "")
             if o == "" and n == "" and c == "" and t == "":
                 toks.append("[UNK]")
             else:
@@ -200,16 +221,21 @@ class JyutpingTokenizer:
                 toks.append(tok if tok != "" else "[UNK]")
         return " ".join(toks)
 
-    def vocab_size(self) -> List[int]:
-        return [
+    def component_vocab_sizes(self) -> Tuple[int, int, int, int]:
+        """Return per-component vocab sizes including padding idx 0: (onset, nucleus, coda, tone)"""
+        return (
             len(self.onset_map) + 1,
             len(self.nucleus_map) + 1,
             len(self.coda_map) + 1,
             len(self.tone_map) + 1,
-        ]
+        )
+
+    def vocab_size(self) -> int:
+        """Total phoneme vocab size (sum of component sizes, including pad idx 0)."""
+        return TOTAL_PHONEME_VOCAB
 
     def __len__(self) -> int:
-        return sum(self.vocab_size())
+        return self.vocab_size()
 
 
 # small self-test

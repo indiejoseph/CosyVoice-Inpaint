@@ -83,7 +83,7 @@ third_party/
 CosyVoice uses `Qwen2LM` as its core language model. This project introduces:
 
 ```
-Qwen2LMInpaint(Qwen2LM)
+Qwen2LMInpaint(Qwen2LM) — now accepts a single `vocab_size` arg (total phoneme vocab size) and uses a unified `phone_emb`.
 ```
 
 This subclass:
@@ -148,6 +148,20 @@ A dedicated **phoneme processor** is responsible for:
 
 This processor operates **before** tokenization and LLM embedding lookup.
 
+### Phoneme token layout (interleaved per-token)
+
+We use an *interleaved, per-text-token* flattened phoneme format to align phonemes to token positions.
+
+- `phoneme_token` is a flat vector with shape `(B, 4 * L)` where `L` is the padded text token length and each text token owns 4 consecutive slots ordered as:
+
+  `[onset_0, nucleus_0, coda_0, tone_0, onset_1, nucleus_1, coda_1, tone_1, ...]`
+
+- Two common construction patterns are supported:
+  - If your phoneme processor already pads to text length, pass `phoneme_token` shaped `(B, 4*L)` and omit `phoneme_token_len`.
+  - If your phoneme processor returns per-sample flattened lists (length `4*P` where `P <= L` is the number of phoneme tokens), pass that flattened vector *and* `phoneme_token_len` — a `(B,)` tensor of integers containing `P` (the number of phoneme tokens for each sample). The model will place the first `4*P` entries into a `(B, 4, L)` buffer and leave remaining positions as zeros.
+
+**Important:** `phoneme_token_len` refers to the *number of phoneme tokens (P)*, not the flattened slot count `4*P` nor the padded flattened length `4*L`.
+
 ---
 
 ### Embedding Replacement
@@ -200,6 +214,34 @@ An auxiliary regularization loss may be added to keep phoneme embeddings close t
 
 ---
 
+### Quickstart: training example ✅
+
+To run a quick training job (expects a CSV with columns `text`, `speech_tokens`, and optional `phone`):
+
+```bash
+python train.py --data dataset.csv \
+  --qwen_config path/to/qwen/config \
+  --output_dir results/inpaint \
+  --epochs 3 \
+  --per_device_train_batch_size 8 \
+  --learning_rate 1e-4 \
+  --phoneme_keep_prob 0.25 \
+  --phoneme_seed 42 \
+  --report_to none
+```
+
+**Notes:**
+
+- **`--phoneme_keep_prob`** controls the fraction of inline Jyutping annotations inserted into the text (default: `0.25`). ✅
+- **`--dataset_factor`** repeats dataset entries to expand the dataset by that factor (default: `1`). Example: `--phoneme_keep_prob 0.25 --dataset_factor 4` will result in approximately 100% of training examples containing inline annotations. 🔁
+- The training pipeline uses `tokenize_add_label` (to insert bracketed Jyutping) and `InpaintFrontendWrapper` (to normalize text and extract `text_token` and `phoneme_token`). 🔧
+- If your dataset is a CSV, **`pandas`** is required by `train.py` to load it.
+- Make sure the CosyVoice submodule is initialized before running: `git submodule update --init --recursive`. ⚠️
+
+---
+
+---
+
 ## Advantages
 
 * No LLM fine-tuning required
@@ -228,8 +270,28 @@ An auxiliary regularization loss may be added to keep phoneme embeddings close t
 
 **Mitigations:**
 
-* Gated blending of text and phoneme embeddings
-* Learnable mixing coefficients
+* Learnable mixing coefficients (optional)
+
+---
+
+## Installation ✅
+
+Clone the repository and initialize nested submodules, then install Python dependencies in the order shown (CosyVoice requirements first):
+
+```bash
+# Clone with submodules (recommended):
+git clone --recursive <repo-url>
+
+# If already cloned, sync and initialize all submodules (including nested ones like Matcha-TTS):
+git submodule sync --recursive
+git submodule update --init --recursive
+
+# Install requirements (install CosyVoice's requirements first):
+pip install -r third_party/CosyVoice/requirements.txt
+pip install -r requirements.txt
+```
+
+> Note: The CosyVoice submodule contains its own nested `third_party` dependencies (for example `Matcha-TTS`); using `--recursive` ensures these are fetched and checked out at the pinned commits.
 
 ---
 
