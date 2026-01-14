@@ -174,9 +174,10 @@ def cosyvoice2_llm_job(
     self.llm_end_dict[uuid] = True
 
 
-def patch_cosyvoice(cosyvoice: "CosyVoice2Model"):
+def patch_cosyvoice2(cosyvoice: "CosyVoice2Model"):
     from pron_inpaint.frontend_wrapper import InpaintFrontendWrapper
     from pron_inpaint.modeling import Qwen2LMInpaint
+    from pron_inpaint.tokenizer import TONE_OFFSET
 
     inpaint_frontend = InpaintFrontendWrapper(
         frontend=cosyvoice.frontend, device=cosyvoice.model.device
@@ -186,5 +187,8 @@ def patch_cosyvoice(cosyvoice: "CosyVoice2Model"):
     cosyvoice.model.llm_job = cosyvoice2_llm_job.__get__(cosyvoice.model)
     cosyvoice.model.tts = cosyvoice2_tts.__get__(cosyvoice.model)
     cosyvoice.model.llm = Qwen2LMInpaint(
-        cosyvoice.model.llm, phone_vocab_size, composition="concat_linear"
+        cosyvoice.model.llm,
+        phone_vocab_size,
+        composition="concat_linear",
+        tone_offset=TONE_OFFSET,
     ).to(cosyvoice.model.device)
