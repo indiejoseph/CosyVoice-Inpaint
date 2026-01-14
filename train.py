@@ -6,7 +6,7 @@ pattern. Key changes for inpainting:
 
 - Uses `Qwen2LMInpaint` wrapper (from `pron_inpaint.modeling`) around an
   instantiated `Qwen2LM`.
-- Accepts `phoneme_token` per example (space-separated token ids) or falls back
+- Accepts `phone_token` per example (space-separated token ids) or falls back
   to zeros (no inpainting).
 - Provides a forward wrapper `inpaint_trainer_forward` bound to the inpaint
   model so that `Trainer` can call `model(**inputs)`.
@@ -42,7 +42,7 @@ from cosyvoice.llm.llm import Qwen2LM
 # Our inpaint implementation
 from pron_inpaint.modeling import Qwen2LMInpaint
 from pron_inpaint.frontend_wrapper import InpaintFrontendWrapper
-from pron_inpaint.tokenizer import JyutpingTokenizer
+from pron_inpaint.tokenizer import JyutpingTokenizer, TONE_OFFSET
 
 
 def parse_args():
@@ -50,7 +50,7 @@ def parse_args():
     p.add_argument(
         "--data",
         required=True,
-        help="CSV file with dataset (text, codes, optional phoneme_token)",
+        help="CSV file with dataset (text, codes, optional phone_token)",
     )
     p.add_argument(
         "--qwen_config",
@@ -122,11 +122,10 @@ class CustomDataCollatorWithPadding:
         speech_tokens = [torch.LongTensor(f["speech_token"]) for f in features]
         speech_lens = [len(s) for s in speech_tokens]
 
-        # phoneme_token is pre-flattened into space-separated ints per example
-        # Use simple pad_sequence on the flattened vectors and expose phoneme_token_len
-        phoneme_tensors = [torch.LongTensor(f["phoneme_token"]) for f in features]
-        phoneme_flat = pad_sequence(phoneme_tensors, batch_first=True, padding_value=0)
-        phoneme_lens = [int(len(f["phoneme_token"]) // 4) for f in features]
+        # phone_token is pre-flattened into space-separated ints per example
+        # Use simple pad_sequence on the flattened vectors and expose phone_token_len
+        phone_tensors = [torch.LongTensor(f["phone_token"]) for f in features]
+        phone_lens = [len(f["phone_token"]) // 4 for f in features]
 
         batch = {
             "text_token": pad_sequence(
@@ -137,8 +136,10 @@ class CustomDataCollatorWithPadding:
                 speech_tokens, batch_first=True, padding_value=self.num_speech_tokens
             ),
             "speech_token_len": torch.LongTensor(speech_lens),
-            "phoneme_token": phoneme_flat,
-            "phoneme_token_len": torch.LongTensor(phoneme_lens),
+            "phone_token": pad_sequence(
+                phone_tensors, batch_first=True, padding_value=0
+            ),
+            "phone_token_len": torch.LongTensor(phone_lens),
         }
         return batch
 
@@ -247,11 +248,6 @@ def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
 
-    # Delegate jyutping parsing to pron_inpaint.tokenizer
-    from pron_inpaint.tokenizer import (
-        JyutpingTokenizer,
-    )
-
     # Load dataset: if a CSV file path is provided, use pandas to read and convert to a Dataset;
     # otherwise prefer HuggingFace `load_dataset` and fall back to `load_from_disk`.
     if isinstance(args.data, str) and args.data.lower().endswith(".csv"):
@@ -269,41 +265,8 @@ def main():
         except Exception:
             ds = load_from_disk(args.data)
 
-    import random
-
     # instantiate a JyutpingTokenizer for parsing phoneme annotations
     jyutoken = JyutpingTokenizer()
-
-    def _mask_phon_flat(
-        phon_flat: List[int], L: int, keep_prob: float, seed: int, sample_key: str
-    ) -> List[int]:
-        """Deterministically zero-out phoneme components so that approximately
-        `keep_prob` fraction of tokens keep their phoneme IDs.
-        Uses a stable pseudo-random instance based on seed and sample_key.
-
-        This function is robust: if `phon_flat` is shorter than 4*L, it pads
-        each component with zeros to avoid IndexError and returns a 4*L list.
-        """
-
-        # safely slice and pad to length L
-        def _slice_pad(start: int, end: int):
-            seg = phon_flat[start:end]
-            if len(seg) < L:
-                seg = seg + [0] * (L - len(seg))
-            return list(seg)
-
-        onset = _slice_pad(0, L)
-        nucleus = _slice_pad(L, 2 * L)
-        coda = _slice_pad(2 * L, 3 * L)
-        tone = _slice_pad(3 * L, 4 * L)
-        rng = random.Random(seed ^ (abs(hash(sample_key)) & 0xFFFFFFFF))
-        for i in range(L):
-            if rng.random() >= keep_prob:
-                onset[i] = 0
-                nucleus[i] = 0
-                coda[i] = 0
-                tone[i] = 0
-        return onset + nucleus + coda + tone
 
     # Use the reusable tokenize_add_label implementation from pron_inpaint.utils
     from pron_inpaint.utils import tokenize_add_label
@@ -323,18 +286,12 @@ def main():
     dataset = dataset.filter(lambda ex: ex.get("valid_phon", False), num_proc=12)
 
     # Second pass (single-process): use the InpaintFrontendWrapper to normalize the
-    # text and extract `text_token` and `phoneme_token` buffers aligned to text tokens.
+    # text and extract `text_token` and `phone_token` buffers aligned to text tokens.
     def _apply_frontend(ex, tokenizer_path=None):
-        # Local imports to avoid pickling issues when using dataset.map in parallel
-        from pron_inpaint.tokenizer import JyutpingTokenizer
-
         # Cache frontend wrapper on the function object to avoid instantiating it for
         # every example (expensive). This is safe when running with num_proc=1.
         if not hasattr(_apply_frontend, "_fw") or _apply_frontend._fw is None:
-            phone_tokenizer = JyutpingTokenizer()
-            _apply_frontend._fw = InpaintFrontendWrapper(
-                phone_tokenizer=phone_tokenizer, tokenizer_path=tokenizer_path
-            )
+            _apply_frontend._fw = InpaintFrontendWrapper(tokenizer_path=tokenizer_path)
         fw = _apply_frontend._fw
 
         text_with = ex.get("text_with_jyutping", ex.get("text", ""))
@@ -342,14 +299,13 @@ def main():
         norm_text = fw.text_normalize(text_with, split=False, text_frontend=True)
         text_token, _ = fw._extract_text_token(norm_text)
         phone_token, _ = fw._extract_phone_token(norm_text, text_token)
-
         text_tokens_list = text_token[0].tolist() if text_token.numel() > 0 else []
         phone_tokens_list = phone_token[0].tolist() if phone_token.numel() > 0 else []
 
         return {
             "text_token": text_tokens_list,
             "speech_token": ex.get("speech_token", ex.get("speech_tokens", [])),
-            "phoneme_token": phone_tokens_list,
+            "phone_token": phone_tokens_list,
             "valid_phon": True if len(phone_tokens_list) > 0 else False,
         }
 
@@ -360,7 +316,7 @@ def main():
         remove_columns=[
             c
             for c in dataset.column_names
-            if c not in ("text_token", "speech_token", "phoneme_token", "valid_phon")
+            if c not in ("text_token", "speech_token", "phone_token", "valid_phon")
         ],
         num_proc=1,
     )
@@ -385,7 +341,7 @@ def main():
     # Use vocab sizes provided by the JyutpingTokenizer and compute a single unified vocab_size
     vocab_size = jyutoken.vocab_size()
 
-    # drop helper columns and keep phoneme_token (already numeric) from tokenize_add_label
+    # drop helper columns and keep phone_token (already numeric) from tokenize_add_label
     dataset = dataset.map(
         lambda ex: {k: ex[k] for k in ex if k not in ("valid_phon",)},
         remove_columns=["valid_phon"],
@@ -403,6 +359,7 @@ def main():
     inpaint_model = Qwen2LMInpaint(
         qwen2lm,
         vocab_size=vocab_size,
+        tone_offset=TONE_OFFSET,
         composition="concat_linear",
     )
     # Initialize phone embedding weights from unified embedding

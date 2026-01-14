@@ -121,7 +121,6 @@ class InpaintFrontendWrapper:
                 self.text_frontend = "wetext"
                 logging.info("use wetext frontend")
             except Exception as e:
-                print("dd", e)
                 self.text_frontend = ""
                 logging.info("no frontend is avaliable")
 

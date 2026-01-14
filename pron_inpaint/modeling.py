@@ -48,7 +48,10 @@ class Qwen2LMInpaint(nn.Module):
         self,
         qwen2lm: "Qwen2LM",
         vocab_size: int,
+        tone_offset: int,
         composition: str = "concat_linear",
+        num_tones=7,  # 6 for Cantonese + 1 for pad / no tone
+        tone_weight=0.3,
     ):
         """Note: `vocab_size` must be the total phoneme vocabulary size including pad idx 0.
         For example: vocab_size = (n_onset + n_nucleus + n_coda + n_tone + 1)
@@ -58,6 +61,8 @@ class Qwen2LMInpaint(nn.Module):
         self.d_model = qwen2lm.llm_input_size
         assert composition in ("concat_linear", "sum")
         self.composition = composition
+        self.tone_weight = tone_weight
+        self.tone_offset = tone_offset
 
         # unified phoneme embedding table: index 0 is reserved as "no phoneme" / padding
         total_vocab = vocab_size
@@ -65,10 +70,14 @@ class Qwen2LMInpaint(nn.Module):
         self.composer = torch.nn.Identity()
         if composition == "concat_linear":
             self.composer = nn.Sequential(
-                nn.Linear(4 * self.d_model, self.d_model),
+                nn.Linear(
+                    3 * self.d_model, self.d_model
+                ),  # onset+nucleus+coda concatenated, tone as residual
                 nn.GELU(),
                 nn.Linear(self.d_model, self.d_model),
             )
+        self.num_tones = num_tones
+        self.tone_classifier = nn.Linear(self.d_model, self.num_tones)
 
     def compose_phoneme(
         self, phoneme_flat: torch.LongTensor, phone_token_len: torch.LongTensor = None
@@ -141,8 +150,8 @@ class Qwen2LMInpaint(nn.Module):
         if self.composition == "sum":
             out = on + nu + co + to
         else:  # concat_linear
-            cat = torch.cat([on, nu, co, to], dim=-1)
-            out = self.composer(cat)
+            cat = torch.cat([on, nu, co], dim=-1)
+            out = self.composer(cat) + to  # tone as residual
 
         # pf_mask: (B, L) True where any component != 0
         pf_mask = (pf4 != 0).any(dim=1)
@@ -291,44 +300,63 @@ class Qwen2LMInpaint(nn.Module):
         text_token_len = batch["text_token_len"].to(device)
         speech_token = batch["speech_token"].to(device)
         speech_token_len = batch["speech_token_len"].to(device)
+        phone_token = batch["phone_token"].to(device)
+        tone_ids = phone_token[:, 3::4]  # (B, L)
 
         # 1. encode text_token
         text_token_emb = self.qwen2lm.llm.model.model.embed_tokens(text_token)
 
         # if a merged phone_token is provided, split it into components and integrate phoneme embeddings
-        if "phone_token" in batch and batch["phone_token"] is not None:
-            phone_token = batch["phone_token"].to(device)
-            if phone_token.dim() != 2:
-                raise ValueError("`phone_token` must be shape (B, 4 * L)")
-            B, PT_len = phone_token.shape
-            _, text_len = text_token.shape
-            if PT_len != 4 * text_len:
+        if phone_token.dim() != 2:
+            raise ValueError("`phone_token` must be shape (B, 4 * L)")
+
+        B, PT_len = phone_token.shape
+        _, text_len = text_token.shape
+        if PT_len != 4 * text_len:
+            raise ValueError(
+                "`phone_token` second dimension must equal 4 * text_token length"
+            )
+        phone_token_len = batch.get("phone_token_len", None)
+        if phone_token_len is not None:
+            phone_token_len = phone_token_len.to(device)
+            if phone_token_len.dim() != 1 or phone_token_len.numel() != B:
                 raise ValueError(
-                    "`phone_token` second dimension must equal 4 * text_token length"
+                    "`phone_token_len` must be shape (B,) matching batch size"
                 )
-            phone_token_len = batch.get("phone_token_len", None)
-            if phone_token_len is not None:
-                phone_token_len = phone_token_len.to(device)
-                if phone_token_len.dim() != 1 or phone_token_len.numel() != B:
-                    raise ValueError(
-                        "`phone_token_len` must be shape (B,) matching batch size"
-                    )
-                if (phone_token_len > text_len).any():
-                    raise ValueError(
-                        "`phone_token_len` values must be <= text_token length (padded)"
-                    )
+            if (phone_token_len > text_len).any():
+                raise ValueError(
+                    "`phone_token_len` values must be <= text_token length (padded)"
+                )
 
-            # Compose phoneme embeddings (returns composed (B, L, D) and a mask pf_mask (B, L))
-            composed, pf_mask = self.compose_phoneme(phone_token, phone_token_len)
+        # Compose phoneme embeddings (returns composed (B, L, D) and a mask pf_mask (B, L))
+        composed, pf_mask = self.compose_phoneme(phone_token, phone_token_len)
 
-            # Zero out text embeddings at phoneme-inpainted positions
-            text_token_emb = text_token_emb * (~pf_mask).unsqueeze(-1).float()
+        # Tone labels for auxiliary tone prediction loss
+        tone_mask = (tone_ids != 0) & pf_mask  # (B, L)
+        tone_labels = tone_ids - self.tone_offset
+        # set ignore_index for CE
+        tone_labels_ce = tone_labels.clone()
+        tone_labels_ce[~tone_mask] = -100
+        # This forces tone signal to live inside phoneme embedding, not context.
+        tone_logits = self.tone_classifier(
+            composed + 0.0 * text_token_emb.detach()
+        )  # (B, L, num_tones)
+        # compute CE loss
+        tone_logits_flat = tone_logits.view(-1, self.num_tones)
+        tone_labels_flat = tone_labels_ce.view(-1)
 
-            # Ensure composed is zero where no components exist
-            composed = composed * pf_mask.unsqueeze(-1).float()
+        tone_loss = F.cross_entropy(
+            tone_logits_flat, tone_labels_flat, ignore_index=-100
+        )
 
-            # Final per-token embedding is text + composed phoneme (text zeros at phoneme slots)
-            text_token_emb = text_token_emb + composed
+        # Zero out text embeddings at phoneme-inpainted positions
+        text_token_emb = text_token_emb * (~pf_mask).unsqueeze(-1).float()
+
+        # Ensure composed is zero where no components exist
+        composed = composed * pf_mask.unsqueeze(-1).float()
+
+        # Final per-token embedding is text + composed phoneme (text zeros at phoneme slots)
+        text_token_emb = text_token_emb + composed
 
         # 3. sos and task_id
         sos_emb = self.qwen2lm.llm_embedding.weight[self.qwen2lm.sos].reshape(1, 1, -1)
@@ -355,7 +383,7 @@ class Qwen2LMInpaint(nn.Module):
         # 4. run lm forward
         lm_output, lm_output_mask = self.qwen2lm.llm(lm_input, lm_input_len.to(device))
         logits = self.qwen2lm.llm_decoder(lm_output)
-        loss = self.qwen2lm.criterion_ce(logits, lm_target.to(device))
+        lm_loss = self.qwen2lm.criterion_ce(logits, lm_target.to(device))
         acc = F.one_hot(
             torch.argmax(logits, dim=-1), num_classes=self.qwen2lm.speech_token_size + 3
         ).float()  # placeholder for accuracy
@@ -372,7 +400,14 @@ class Qwen2LMInpaint(nn.Module):
             # fall back to coarse accuracy reporting: fraction of non-IGNORE_ID correct tokens
             acc = torch.tensor(0.0, device=device)
 
-        return {"loss": loss, "acc": acc}
+        loss = lm_loss + self.tone_weight * tone_loss
+
+        return {
+            "loss": loss,
+            "acc": acc,
+            "lm_loss": lm_loss.detach(),
+            "tone_loss": tone_loss.detach(),
+        }
 
     # small utility: initialize component embeddings from the average text embedding
     def init_component_from_text_embed(self):

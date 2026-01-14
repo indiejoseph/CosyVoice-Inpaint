@@ -10,7 +10,7 @@ This module uses `pycantonese` when available for robust parsing and falls back 
 conservative regex if not.
 """
 
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Union
 import re
 
 # Fixed component vocabularies (index 0 reserved for padding / no-phoneme)
@@ -116,18 +116,12 @@ def components_to_ids(
 
 
 def convert_phone_str_to_flat_ids(phone_str: str, L: int) -> List[int]:
-    """Parse phone_str and return flattened 4*L ids in a single global id space:
-    [onset1..onsetL, nucleus1..nucleusL (offsetted), coda1..codaL (offsetted), tone1..toneL (offsetted)].
-
-    This ensures phoneme ids are unique across components. Pad/index 0 remains reserved.
-    Raises ValueError on length mismatch or None phone_str.
-    """
+    """Return flattened interleaved 4*L ids: [onset0,nucleus0,coda0,tone0, onset1,...]"""
     onset_l, nucleus_l, coda_l, tone_l = parse_phone_str(phone_str, L)
     onset_ids, nucleus_ids, coda_ids, tone_ids = components_to_ids(
         onset_l, nucleus_l, coda_l, tone_l
     )
 
-    # apply offsets to make unique ids in single space
     def _offset_list(lst: List[int], offset: int) -> List[int]:
         return [i + offset if i != 0 else 0 for i in lst]
 
@@ -135,7 +129,12 @@ def convert_phone_str_to_flat_ids(phone_str: str, L: int) -> List[int]:
     nucleus_global = _offset_list(nucleus_ids, NUCLEUS_OFFSET)
     coda_global = _offset_list(coda_ids, CODA_OFFSET)
     tone_global = _offset_list(tone_ids, TONE_OFFSET)
-    return onset_global + nucleus_global + coda_global + tone_global
+
+    # interleave per-token
+    flat_ids = []
+    for o, n, c, t in zip(onset_global, nucleus_global, coda_global, tone_global):
+        flat_ids.extend([o, n, c, t])
+    return flat_ids
 
 
 class JyutpingTokenizer:
@@ -184,41 +183,40 @@ class JyutpingTokenizer:
             outs.append(flat)
         return outs
 
-    def decode(self, flat_ids: List[int]) -> str:
-        """Decode flattened ids into a reconstructed Jyutping string.
+    def decode(self, flat_ids: list):
+        """Decode flattened interleaved ids into Jyutping string.
 
-        - If multiple items (batch), returns a list of decoded strings.
-        - For tokens with all-zero components (no phoneme), returns "[UNK]" for that slot.
+        - Handles batch (list of lists) as well.
+        - For tokens with all-zero components, returns "[UNK]".
         """
         if isinstance(flat_ids[0], list):
             # batch
             return [self.decode(x) for x in flat_ids]
-        L4 = len(flat_ids)
-        if L4 % 4 != 0:
+
+        if len(flat_ids) % 4 != 0:
             raise ValueError("flat_ids length must be divisible by 4")
-        L = L4 // 4
-        o_ids = flat_ids[0:L]
-        n_ids = flat_ids[L : 2 * L]
-        c_ids = flat_ids[2 * L : 3 * L]
-        t_ids = flat_ids[3 * L : 4 * L]
+
         toks = []
-        for i in range(L):
-            # global ids: convert back to per-component local ids before lookup
+        for i in range(0, len(flat_ids), 4):
+            o_gid, n_gid, c_gid, t_gid = flat_ids[i : i + 4]
+
+            # convert global IDs back to per-component local IDs
             def _local(gid, offset):
                 return gid - offset if gid != 0 else 0
 
-            o = self.onset_inv.get(_local(o_ids[i], ONSET_OFFSET), "")
-            n = self.nucleus_inv.get(_local(n_ids[i], NUCLEUS_OFFSET), "")
-            c = self.coda_inv.get(_local(c_ids[i], CODA_OFFSET), "")
-            t = self.tone_inv.get(_local(t_ids[i], TONE_OFFSET), "")
+            o = self.onset_inv.get(_local(o_gid, ONSET_OFFSET), "")
+            n = self.nucleus_inv.get(_local(n_gid, NUCLEUS_OFFSET), "")
+            c = self.coda_inv.get(_local(c_gid, CODA_OFFSET), "")
+            t = self.tone_inv.get(_local(t_gid, TONE_OFFSET), "")
+
             if o == "" and n == "" and c == "" and t == "":
                 toks.append("[UNK]")
             else:
-                # Reconstruct Jyutping token as onset + nucleus + coda + tone when available
                 tok = "".join([p for p in (o, n, c) if p != ""]) + (
                     t if t != "" else ""
                 )
                 toks.append(tok if tok != "" else "[UNK]")
+
         return " ".join(toks)
 
     def vocab_size(self) -> int:
